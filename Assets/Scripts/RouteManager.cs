@@ -79,8 +79,8 @@ public class RouteManager : MonoBehaviour
     private List<ARAnchor> arrowAnchors = new List<ARAnchor>();
 
     // GPS coordinates
-    private Vector2d currentPosition = new Vector2d(29.907944, 78.096468);
-    private Vector2d destination = new Vector2d(29.907151583693413, 78.09683033363609);
+    private Vector2d currentPosition = new Vector2d(28.457747632781057, 77.49689444467059);
+    private Vector2d destination = new Vector2d(28.45695439935732, 77.49667533822735);
     private Mapbox.Utils.Vector2d referencePosition;
 
     private Vector3 arOriginWorldPos = Vector3.zero;
@@ -427,36 +427,38 @@ public class RouteManager : MonoBehaviour
         UpdateStatus("Getting route...");
         bool success = false;
 
-        try
+        if (useTestRoute)
         {
-            if (useTestRoute)
+            // Handle test route (no API call needed)
+            try
             {
                 LogAR("🧪 ENHANCED: Generating test route...");
                 rawRoutePoints = GenerateTestRoute(currentPosition, destination, 20);
-            }
-            else
-            {
-                LogAR("🌐 Real Mapbox API request (fallback to test if fails)...");
-                rawRoutePoints = GenerateTestRoute(currentPosition, destination, 15);
-            }
 
-            if (rawRoutePoints != null && rawRoutePoints.Count > 0)
-            {
-                routeReceived = true;
-                LogAR($"✅ Route generated: {rawRoutePoints.Count} points");
-                success = true;
+                if (rawRoutePoints != null && rawRoutePoints.Count > 0)
+                {
+                    routeReceived = true;
+                    LogAR($"✅ Route generated: {rawRoutePoints.Count} points");
+                    success = true;
+                }
+                else
+                {
+                    LogErrorAR("❌ Test route generation returned null or empty");
+                    UpdateStatus("Route generation failed");
+                    routeRequested = false;
+                }
             }
-            else
+            catch (System.Exception e)
             {
-                LogErrorAR("❌ Route generation returned null or empty");
-                UpdateStatus("Route generation failed");
+                LogErrorAR($"❌ Exception in test route generation: {e.Message}");
                 routeRequested = false;
             }
         }
-        catch (System.Exception e)
+        else
         {
-            LogErrorAR($"❌ Exception in route generation: {e.Message}");
-            routeRequested = false;
+            // Handle real API call with coroutine
+            yield return StartCoroutine(RequestRealRoute());
+            success = routeReceived;
         }
 
         if (success)
@@ -467,6 +469,46 @@ public class RouteManager : MonoBehaviour
         }
 
         LogAR("=== ROUTE REQUEST COMPLETED ===");
+    }
+
+    private IEnumerator RequestRealRoute()
+    {
+        LogAR("🌐 Querying real Mapbox Directions API...");
+
+        bool queryCompleted = false;
+        DirectionsResponse apiResponse = null;
+        Vector2d[] waypoints = new Vector2d[] { currentPosition, destination };
+        DirectionResource dr = new DirectionResource(waypoints, RoutingProfile.Walking);
+        dr.Steps = true;
+
+        _directions.Query(dr, (DirectionsResponse res) =>
+        {
+            apiResponse = res;
+            queryCompleted = true;
+        });
+
+        // Wait for the query to complete
+        float timeout = 10f;
+        float elapsed = 0f;
+
+        while (!queryCompleted && elapsed < timeout)
+        {
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        if (queryCompleted && apiResponse != null && apiResponse.Routes != null && apiResponse.Routes.Count > 0)
+        {
+            rawRoutePoints = apiResponse.Routes[0].Geometry;
+            routeReceived = true;
+            LogAR($"✅ Real route fetched: {rawRoutePoints.Count} points");
+        }
+        else
+        {
+            LogErrorAR("❌ Real route query failed or timed out - falling back to test route");
+            rawRoutePoints = GenerateTestRoute(currentPosition, destination, 15);
+            routeReceived = (rawRoutePoints != null && rawRoutePoints.Count > 0);
+        }
     }
 
     // FIXED: ProcessRouteData method
@@ -492,28 +534,35 @@ public class RouteManager : MonoBehaviour
         for (int i = 0; i < rawRoutePoints.Count; i++)
         {
             Vector2d gpsPoint = rawRoutePoints[i];
-            LogAR($"GPS→AR: ({gpsPoint.x:F6}, {gpsPoint.y:F6}) →");
-
             Vector3 arPosition = ConvertGPSToAR(gpsPoint);
             routeARPositions.Add(arPosition);
 
-            LogAR($"   GPS→AR [{i}]: ({gpsPoint.x:F6}, {gpsPoint.y:F6}) → ({arPosition.x:F2}, {arPosition.y:F2}, {arPosition.z:F2})");
-
-            if (i % 5 == 4) yield return null;
+            if (i % 3 == 2) yield return null;
         }
 
         LogAR($"✅ Converted {routeARPositions.Count} points to AR coordinates");
 
-        selectedRouteIndices = SelectRoutePoints(routeARPositions, arrowSpacing);
-        LogAR($"📌 Selected {selectedRouteIndices.Count} points for arrows");
+        // FIXED: Use proper spacing for indoor testing
+        float actualSpacing = arrowSpacing; // Use the base spacing directly
 
-        for (int i = 0; i < selectedRouteIndices.Count; i++)
+        if (useTestRoute)
         {
-            int idx = selectedRouteIndices[i];
-            Vector3 pos = routeARPositions[idx];
-            LogAR($"  Selected [{i}]: Index {idx}, Position ({pos.x:F2}, {pos.y:F2}, {pos.z:F2})");
+            // For indoor testing, we want arrows closer together for better visualization
+            actualSpacing = arrowSpacing; // Keep the 3m spacing you set
+            LogAR($"🏠 Indoor mode: Using {actualSpacing}m spacing for better visualization");
+        }
+        else
+        {
+            actualSpacing = arrowSpacing * 2; // Outdoor can be more spaced
+            LogAR($"🌍 Outdoor mode: Using {actualSpacing}m spacing");
         }
 
+        LogAR($"🎯 Using selection spacing: {actualSpacing}m");
+
+        List<int> selected = SelectRoutePoints(routeARPositions, actualSpacing);
+        selectedRouteIndices = selected;
+
+        LogAR($"📌 Selected {selectedRouteIndices.Count} points for arrows");
         UpdateStatus($"Route ready: {selectedRouteIndices.Count} arrows");
 
         LogAR("🚀 TRIGGERING ARROW SPAWNING...");
@@ -528,18 +577,21 @@ public class RouteManager : MonoBehaviour
         double latDiff = gpsPoint.x - routeOrigin.x;
         double lonDiff = gpsPoint.y - routeOrigin.y;
 
-        LogAR($"  LatDiff: {latDiff:F8}, LonDiff: {lonDiff:F8}");
-
         double metersPerDegreeLat = 111320.0;
         double metersPerDegreeLon = 111320.0 * System.Math.Cos(routeOrigin.x * System.Math.PI / 180.0);
 
         double xMeters = lonDiff * metersPerDegreeLon;
         double zMeters = latDiff * metersPerDegreeLat;
 
+        // FIXED: Apply indoor scaling correctly
         if (useTestRoute)
         {
+            // For indoor testing, we want the route to appear at a reasonable size
+            // The indoor scale factor makes coordinates visible in AR
             xMeters *= indoorScaleFactor;
             zMeters *= indoorScaleFactor;
+
+            LogAR($"   Indoor scaled: X={xMeters:F6}m, Z={zMeters:F6}m (scale factor: {indoorScaleFactor})");
         }
 
         float x = (float)xMeters;
@@ -547,41 +599,122 @@ public class RouteManager : MonoBehaviour
         float y = 0f;
 
         Vector3 result = new Vector3(x, y, z);
-
-        LogAR($"   Meters: X={xMeters:F6}, Z={zMeters:F6}");
-        LogAR($"   Final AR: ({result.x:F3}, {result.y:F3}, {result.z:F3})");
-
+        result = northAlignment * result;
         return result;
     }
+    // 4. ADDITIONAL: Add this method to test with better settings
+[ContextMenu("Test Indoor Route with Optimal Settings")]
+public void TestIndoorRouteOptimal()
+{
+    LogAR("🧪 TESTING WITH OPTIMAL INDOOR SETTINGS...");
+    
+    // Temporarily adjust settings for better indoor experience
+    float originalSpacing = arrowSpacing;
+    int originalMaxArrows = maxArrows;
+    
+    arrowSpacing = 2f; // Closer spacing for indoor
+    maxArrows = 6;     // Fewer arrows for clarity
+    
+    LogAR($"🔧 Adjusted settings: spacing={arrowSpacing}m, maxArrows={maxArrows}");
+    
+    // Clear and regenerate
+    ClearExistingArrows();
+    rawRoutePoints.Clear();
+    routeARPositions.Clear();
+    selectedRouteIndices.Clear();
+    routeRequested = false;
+    routeReceived = false;
+    arrowsSpawned = false;
+    
+    // Start fresh route generation
+    StartCoroutine(RequestNavigationRoute());
+    
+    LogAR("✅ Testing with optimal indoor settings...");
+}
 
     // FIXED: SelectRoutePoints method
+    // ADJUSTED STEP 1: Modified SelectRoutePoints for your settings
     private List<int> SelectRoutePoints(List<Vector3> arPositions, float minSpacing)
     {
         List<int> selectedIndices = new List<int>();
 
         if (arPositions.Count == 0) return selectedIndices;
-
-        // Always include first point
-        selectedIndices.Add(0);
-        Vector3 lastSelectedPos = arPositions[0];
-
-        // Select points based on distance
-        for (int i = 1; i < arPositions.Count - 1; i++)
+        if (arPositions.Count == 1)
         {
-            float distance = Vector3.Distance(lastSelectedPos, arPositions[i]);
-            if (distance >= minSpacing)
+            selectedIndices.Add(0);
+            return selectedIndices;
+        }
+
+        LogAR("🎯 SELECTION ALGORITHM START:");
+        LogAR($"   Input: {arPositions.Count} AR positions");
+        LogAR($"   Min spacing: {minSpacing:F2}m");
+        LogAR($"   Max arrows: {maxArrows}");
+
+        // Compute cumulative distances
+        List<float> cumDist = new List<float> { 0f };
+        for (int i = 1; i < arPositions.Count; i++)
+        {
+            float d = Vector3.Distance(arPositions[i], arPositions[i - 1]);
+            cumDist.Add(cumDist[i - 1] + d);
+        }
+        float totalDist = cumDist[cumDist.Count - 1];
+        LogAR($"   Total AR distance: {totalDist:F2}m");
+
+        // Determine number of arrows: respect min spacing and maxArrows
+        int maxPossibleArrows = Mathf.FloorToInt(totalDist / minSpacing) + 1;
+        int numArrows = Mathf.Min(maxArrows, maxPossibleArrows);
+        numArrows = Mathf.Max(numArrows, 2); // Always at least start + end
+        LogAR($"   Selecting {numArrows} arrows (max possible: {maxPossibleArrows})");
+
+        float idealSpacing = totalDist / (numArrows - 1f);
+        LogAR($"   Ideal spacing: {idealSpacing:F2}m");
+
+        // Always include start
+        selectedIndices.Add(0);
+        LogAR($"✅ Selected START: Index 0, Position: ({arPositions[0].x:F2}, {arPositions[0].y:F2}, {arPositions[0].z:F2}), CumDist: 0.00");
+
+        // Select intermediate points evenly
+        for (int k = 1; k < numArrows - 1; k++)
+        {
+            float targetDist = k * idealSpacing;
+            float bestDiff = float.MaxValue;
+            int bestIndex = -1;
+
+            // Find closest index after last selected
+            int startSearch = selectedIndices[selectedIndices.Count - 1] + 1;
+            for (int j = startSearch; j < arPositions.Count - 1; j++)
             {
-                selectedIndices.Add(i);
-                lastSelectedPos = arPositions[i];
+                float diff = Mathf.Abs(cumDist[j] - targetDist);
+                if (diff < bestDiff)
+                {
+                    bestDiff = diff;
+                    bestIndex = j;
+                }
+                else
+                {
+                    break; // Since cumDist increasing
+                }
+            }
+
+            if (bestIndex != -1)
+            {
+                selectedIndices.Add(bestIndex);
+                Vector3 pos = arPositions[bestIndex];
+                LogAR($"✅ Selected WAYPOINT: Index {bestIndex}, Position: ({pos.x:F2}, {pos.y:F2}, {pos.z:F2}), CumDist: {cumDist[bestIndex]:F2}, Target: {targetDist:F2}");
             }
         }
 
-        // Always include last point if not already included
-        if (selectedIndices[selectedIndices.Count - 1] != arPositions.Count - 1)
+        // Always include end
+        int endIndex = arPositions.Count - 1;
+        if (!selectedIndices.Contains(endIndex))
         {
-            selectedIndices.Add(arPositions.Count - 1);
+            selectedIndices.Add(endIndex);
+            Vector3 endPos = arPositions[endIndex];
+            float finalDist = cumDist[endIndex] - cumDist[selectedIndices[selectedIndices.Count - 2]];
+            LogAR($"✅ Selected END: Index {endIndex}, Position: ({endPos.x:F2}, {endPos.y:F2}, {endPos.z:F2}), Distance from last: {finalDist:F2}m");
         }
 
+        LogAR($"🎉 SELECTION COMPLETE: {selectedIndices.Count} points selected");
         return selectedIndices;
     }
 
@@ -749,58 +882,77 @@ public class RouteManager : MonoBehaviour
 
     private List<Vector2d> GenerateTestRoute(Vector2d start, Vector2d end, int totalPoints)
     {
-        LogAR($"🧪 Generating INDOOR test route: {totalPoints} points");
+        LogAR($"🧪 GENERATING INDOOR-OPTIMIZED TEST ROUTE:");
+        LogAR($"   Start: {start.x:F8}, {start.y:F8}");
+        LogAR($"   End: {end.x:F8}, {end.y:F8}");
+        LogAR($"   Requested points: {totalPoints}");
+        LogAR($"   Settings: Indoor scale={indoorScaleFactor}, Arrow spacing={arrowSpacing}m");
+
         List<Vector2d> route = new List<Vector2d>();
 
-        Vector2d current = start;
-        route.Add(current);
+        // FIXED: For indoor testing, create a much smaller route
+        // Instead of 200m real-world route, create a 20m route that scales to 200m
+        double realWorldDistance = 20.0; // meters
+        double metersPerDegreeLat = 111320.0;
+        double metersPerDegreeLon = 111320.0 * System.Math.Cos(start.x * System.Math.PI / 180.0);
 
-        // Create realistic route with turns (simulating your 250m route)
-        double totalLatDiff = end.x - start.x;
-        double totalLonDiff = end.y - start.y;
+        // Convert desired distance to GPS degrees
+        double latRange = realWorldDistance / metersPerDegreeLat;
+        double lonRange = realWorldDistance / metersPerDegreeLon;
 
+        LogAR($"   Creating {realWorldDistance}m route for indoor testing");
+        LogAR($"   GPS ranges: Lat={latRange:F8}, Lon={lonRange:F8}");
+
+        // Always start with start point
+        route.Add(start);
+
+        // Generate intermediate points along a realistic walking path
         for (int i = 1; i < totalPoints - 1; i++)
         {
             float progress = (float)i / (totalPoints - 1);
-
-            // Create turns in the route
             Vector2d point;
-            if (progress < 0.3f)
+
+            // Create a simple L-shaped route for indoor testing
+            if (progress <= 0.6f)
             {
-                // First segment: mostly north
-                float t = progress / 0.3f;
+                // First segment: move north
+                float segmentProgress = progress / 0.6f;
                 point = new Vector2d(
-                    start.x + totalLatDiff * 0.7 * t,
-                    start.y + totalLonDiff * 0.1 * t
-                );
-            }
-            else if (progress < 0.7f)
-            {
-                // Second segment: turn east
-                float t = (progress - 0.3f) / 0.4f;
-                point = new Vector2d(
-                    start.x + totalLatDiff * 0.7,
-                    start.y + totalLonDiff * 0.8 * t
+                    start.x + latRange * 0.8 * segmentProgress,  // 80% north movement
+                    start.y + lonRange * 0.1 * segmentProgress   // 10% east movement
                 );
             }
             else
             {
-                // Final segment: to destination
-                float t = (progress - 0.7f) / 0.3f;
-                Vector2d segmentStart = new Vector2d(start.x + totalLatDiff * 0.7, start.y + totalLonDiff * 0.8);
-                point = Vector2d.Lerp(segmentStart, end, t);
+                // Second segment: turn east
+                float segmentProgress = (progress - 0.6f) / 0.4f;
+                Vector2d segmentStart = new Vector2d(
+                    start.x + latRange * 0.8,
+                    start.y + lonRange * 0.1
+                );
+                point = new Vector2d(
+                    segmentStart.x + latRange * 0.2 * segmentProgress,  // Complete north
+                    segmentStart.y + lonRange * 0.9 * segmentProgress   // Major east movement
+                );
             }
 
             route.Add(point);
+
+            if (i % 5 == 0 || i < 5)
+            {
+                LogAR($"   Point[{i}]: {point.x:F8}, {point.y:F8} (progress: {progress:F2})");
+            }
         }
 
-        route.Add(end);
+        // Always end with destination (adjusted to be within small range)
+        Vector2d adjustedEnd = new Vector2d(
+            start.x + latRange,
+            start.y + lonRange
+        );
+        route.Add(adjustedEnd);
 
-        LogAR($"✅ Indoor test route generated: {route.Count} points with turns");
-        for (int i = 0; i < Mathf.Min(5, route.Count); i++)
-        {
-            LogAR($"  Point {i}: {route[i].x:F8}, {route[i].y:F8}");
-        }
+        LogAR($"🎉 Indoor-optimized route generated: {route.Count} points");
+        LogAR($"📐 Real-world span: {realWorldDistance}m, AR span after scaling: {realWorldDistance * indoorScaleFactor}m");
 
         return route;
     }
@@ -888,23 +1040,68 @@ public class RouteManager : MonoBehaviour
     {
         if (debugText != null)
         {
-            debugText.text = $"=== AR NAV DEBUG V4.0 FIXED ===\n" +
+            debugText.text = $"=== AR NAV DEBUG V5.0 FIXED ===\n" +
                              $"Status: {currentStatus}\n" +
                              $"GPS: {(locationInitialized ? "Ready" : "Init...")}\n" +
                              $"Planes: {planesDetected} (Locked: {planeLocked})\n" +
                              $"Route Points: {rawRoutePoints.Count}\n" +
+                             $"AR Positions: {routeARPositions.Count}\n" +
                              $"Selected: {selectedRouteIndices.Count}\n" +
                              $"Active Arrows: {activeArrows.Count}\n" +
+                             $"Spawned: {spawnedArrows.Count}\n" +
                              $"Mode: {(useTestRoute ? "TEST/INDOOR" : "OUTDOOR/REAL")}\n" +
                              $"Scale Factor: {indoorScaleFactor}\n" +
-                             $"GPS Pos: {currentPosition.x:F6}, {currentPosition.y:F6}";
+                             $"Spacing: {arrowSpacing}m\n" +
+                             $"GPS: {currentPosition.x:F6}, {currentPosition.y:F6}";
         }
     }
 
     #endregion
 
     #region Public Methods & Context Menu Commands
+    [ContextMenu("Test Route Selection Algorithm")]
+    public void TestRouteSelectionAlgorithm()
+    {
+        LogAR("🧪 TESTING ROUTE SELECTION ALGORITHM...");
 
+        // Generate test data
+        List<Vector2d> testRoute = GenerateTestRoute(currentPosition, destination, 25); // Many points
+        LogAR($"Generated {testRoute.Count} GPS points");
+
+        // Convert to AR
+        List<Vector3> testARPositions = new List<Vector3>();
+        Vector2d testOrigin = testRoute[0];
+
+        foreach (var gpsPoint in testRoute)
+        {
+            // Simulate GPS to AR conversion
+            double latDiff = gpsPoint.x - testOrigin.x;
+            double lonDiff = gpsPoint.y - testOrigin.y;
+
+            double metersPerDegreeLat = 111320.0;
+            double metersPerDegreeLon = 111320.0 * System.Math.Cos(testOrigin.x * System.Math.PI / 180.0);
+
+            double xMeters = lonDiff * metersPerDegreeLon * indoorScaleFactor;
+            double zMeters = latDiff * metersPerDegreeLat * indoorScaleFactor;
+
+            testARPositions.Add(new Vector3((float)xMeters, 0f, (float)zMeters));
+        }
+
+        LogAR($"Converted to {testARPositions.Count} AR positions");
+
+        // Test selection
+        List<int> selected = SelectRoutePoints(testARPositions, arrowSpacing);
+        LogAR($"Algorithm selected {selected.Count} points from {testARPositions.Count} candidates");
+
+        // Show what would be spawned
+        for (int i = 0; i < selected.Count; i++)
+        {
+            int idx = selected[i];
+            Vector3 pos = testARPositions[idx];
+            string type = i == 0 ? "🟢START" : (i == selected.Count - 1 ? "🔵END" : "🟡MID");
+            LogAR($"   Would spawn: {type} at ({pos.x:F1}, {pos.z:F1})");
+        }
+    }
     [ContextMenu("Force Route Generation")]
     public void ForceRouteGeneration()
     {
