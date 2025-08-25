@@ -156,8 +156,9 @@ public class RouteManager : MonoBehaviour
         UpdateDebugDisplay();
         UpdateUserPosition();
 
-        if (locationInitialized && planeLocked && !routeRequested && !routeReceived)
+        if (locationInitialized && planeLocked && !routeRequested && !routeReceived && !arrowsSpawned)
         {
+            //if (Coroutine.GetInstance().IsRunning(RequestNavigationRoute)) return;  // Skip if already running
             LogAR("🔍 Update detected ready state - triggering route generation");
             StartCoroutine(RequestNavigationRoute());
         }
@@ -363,37 +364,51 @@ public class RouteManager : MonoBehaviour
 
     private IEnumerator SetupCompassAlignmentFixed()
     {
-        LogAR("🧭 FIXED: Setting up compass alignment...");
-        Input.compass.enabled = true;
+        LogAR("🧭 Setting up compass alignment...");
 
-        float waitTime = 0f;
-        while (waitTime < 2f)
+        if (useTestRoute)
         {
-            yield return new WaitForSeconds(0.1f);
-            waitTime += 0.1f;
-
-            if (Input.compass.trueHeading != 0 && !float.IsNaN(Input.compass.trueHeading))
-            {
-                LogAR($"🧭 Compass stabilized early at {waitTime:F1}s: {Input.compass.trueHeading:F1}°");
-                break;
-            }
-        }
-
-        if (Input.compass.trueHeading != 0 && !float.IsNaN(Input.compass.trueHeading))
-        {
-            float heading = Input.compass.trueHeading;
-            northAlignment = Quaternion.Euler(0f, -heading, 0f);
-            LogAR($"✅ Compass ready: {heading:F1}° from true north");
-            UpdateStatus($"Compass aligned: {heading:F1}°");
+            // INDOOR MODE: Use camera direction for visualization
+            LogAR("🏠 INDOOR MODE: Using camera direction for route visualization");
+            northAlignment = Quaternion.Euler(0f, arCamera.transform.eulerAngles.y, 0f);
+            LogAR($"📱 Using camera yaw as north: {arCamera.transform.eulerAngles.y:F1}°");
+            UpdateStatus("Indoor mode - camera aligned");
         }
         else
         {
-            LogAR("⚠️ Compass failed, using default orientation");
-            northAlignment = Quaternion.identity;
-            UpdateStatus("Compass failed - using default");
+            // OUTDOOR MODE: Use real compass for accurate navigation
+            LogAR("🌍 OUTDOOR MODE: Using compass for real navigation");
+            Input.compass.enabled = true;
+
+            float waitTime = 0f;
+            while (waitTime < 2f)
+            {
+                yield return new WaitForSeconds(0.1f);
+                waitTime += 0.1f;
+
+                if (Input.compass.trueHeading != 0 && !float.IsNaN(Input.compass.trueHeading))
+                {
+                    LogAR($"🧭 Compass stabilized early at {waitTime:F1}s: {Input.compass.trueHeading:F1}°");
+                    break;
+                }
+            }
+
+            if (Input.compass.trueHeading != 0 && !float.IsNaN(Input.compass.trueHeading))
+            {
+                float heading = Input.compass.trueHeading;
+                northAlignment = Quaternion.Euler(0f, -heading, 0f);
+                LogAR($"✅ Compass ready: {heading:F1}° from true north");
+                UpdateStatus($"Compass aligned: {heading:F1}°");
+            }
+            else
+            {
+                LogAR("⚠️ Compass failed, falling back to camera direction");
+                northAlignment = Quaternion.Euler(0f, arCamera.transform.eulerAngles.y, 0f);
+                UpdateStatus("Compass failed - using camera direction");
+            }
         }
 
-        LogAR("🚀 FIXED: Forcing route generation after compass setup!");
+        LogAR("🚀 Starting route generation after alignment setup...");
         routeRequested = false;
         routeReceived = false;
         arrowsSpawned = false;
@@ -412,6 +427,13 @@ public class RouteManager : MonoBehaviour
     private IEnumerator RequestNavigationRoute()
     {
         LogAR("=== ENHANCED ROUTE REQUEST START ===");
+        // FIX: Add a master reset here to prevent any old data or objects from persisting.
+        ClearExistingArrows();
+        rawRoutePoints.Clear();
+        routeARPositions.Clear();
+        selectedRouteIndices.Clear();
+        routeReceived = false; // Also reset this flag
+        arrowsSpawned = false;
 
         if (routeRequested)
         {
@@ -528,7 +550,8 @@ public class RouteManager : MonoBehaviour
 
         routeARPositions.Clear();
         selectedRouteIndices.Clear();
-
+        ClearExistingArrows();
+        routeARPositions.Clear();  // Ensure no extras
         LogAR("🔄 Converting GPS points to AR coordinates...");
 
         for (int i = 0; i < rawRoutePoints.Count; i++)
@@ -541,6 +564,39 @@ public class RouteManager : MonoBehaviour
         }
 
         LogAR($"✅ Converted {routeARPositions.Count} points to AR coordinates");
+        // FIX: For indoor testing, center the entire route in front of the camera for easy viewing.
+        if (useTestRoute && routeARPositions.Count > 0 && arCamera != null)
+        {
+            // 1. Calculate the geometric center (centroid) of the route.
+            Vector3 centroid = Vector3.zero;
+            foreach (var pos in routeARPositions)
+            {
+                centroid += pos;
+            }
+            centroid /= routeARPositions.Count;
+            centroid.y = 0f;
+
+            // 2. CORRECTION: The offset is a fixed world distance (3m), so we remove the scale factor.
+            Vector3 cameraForwardOffset = arCamera.transform.forward * 3f;
+            cameraForwardOffset.y = 0f;
+
+            // 3. Get the camera's horizontal rotation.
+            Quaternion cameraYawRot = Quaternion.Euler(0f, arCamera.transform.eulerAngles.y, 0f);
+
+            // 4. Reposition and rotate every point in the route.
+            for (int i = 0; i < routeARPositions.Count; i++)
+            {
+                // Center the route at the world origin
+                routeARPositions[i] -= centroid;
+                // Rotate the route to face the same direction as the camera
+                routeARPositions[i] = cameraYawRot * routeARPositions[i];
+                // Move the now-centered-and-rotated route in front of the camera
+                routeARPositions[i] += cameraForwardOffset;
+            }
+            LogAR($"📍 Route centered and rotated to appear in front of the camera.");
+        }
+        // ===== END OF NEW BLOCK =====
+
 
         // FIXED: Use proper spacing for indoor testing
         float actualSpacing = arrowSpacing; // Use the base spacing directly
@@ -600,6 +656,7 @@ public class RouteManager : MonoBehaviour
 
         Vector3 result = new Vector3(x, y, z);
         result = northAlignment * result;
+        LogAR($"   AR Pos after alignment: ({result.x:F3}, {result.z:F3}), North heading: {Input.compass.trueHeading:F1}");
         return result;
     }
     // 4. ADDITIONAL: Add this method to test with better settings
@@ -718,7 +775,7 @@ public void TestIndoorRouteOptimal()
         return selectedIndices;
     }
 
-    // FIXED: Arrow spawning method
+    // ===== THIS IS THE CORRECTED AND FINAL VERSION =====
     private IEnumerator SpawnNavigationArrowsEnhanced()
     {
         LogAR("=== ENHANCED ARROW SPAWNING START ===");
@@ -752,32 +809,25 @@ public void TestIndoorRouteOptimal()
 
         for (int i = 0; i < selectedRouteIndices.Count; i++)
         {
-            // Extract all operations outside try-catch to allow yield
             bool success = false;
             string errorMessage = "";
 
-            // Attempt to spawn the arrow
             int routeIndex = selectedRouteIndices[i];
             Vector3 arPosition = routeARPositions[routeIndex];
 
             LogAR($"🎯 Spawning arrow {i + 1}/{selectedRouteIndices.Count}");
 
-            // Calculate world position
             Vector3 worldPosition = primaryPlane.transform.TransformPoint(arPosition);
             worldPosition.y = primaryPlane.transform.position.y + arrowHeightOffset;
 
-            // Create anchor using new API
             GameObject anchorObject = null;
             ARAnchor anchor = null;
 
             try
             {
-                // Create a temporary GameObject for the anchor
                 anchorObject = new GameObject($"NavArrowAnchor_{i + 1}");
                 anchorObject.transform.position = worldPosition;
                 anchorObject.transform.rotation = Quaternion.identity;
-
-                // Add ARAnchor component (new API)
                 anchor = anchorObject.AddComponent<ARAnchor>();
 
                 if (anchor != null)
@@ -799,12 +849,12 @@ public void TestIndoorRouteOptimal()
                 LogErrorAR($"❌ Failed to create anchor for arrow {i + 1}: {errorMessage}");
                 if (anchorObject != null)
                 {
-                    DestroyImmediate(anchorObject);
+                    // FIX 2: Replaced DestroyImmediate with Destroy for safer runtime behavior.
+                    Destroy(anchorObject);
                 }
                 continue;
             }
 
-            // Spawn the arrow GameObject
             GameObject arrow = null;
             try
             {
@@ -814,29 +864,41 @@ public void TestIndoorRouteOptimal()
                 arrow.transform.localScale = Vector3.one * arrowScale;
 
                 // Calculate direction
-                Vector3 direction = Vector3.forward;
+                Vector3 direction = arCamera.transform.forward;  // Fallback to camera forward if too close/compass fails
                 if (i < selectedRouteIndices.Count - 1)
                 {
                     int nextIndex = selectedRouteIndices[i + 1];
                     Vector3 nextPosition = routeARPositions[nextIndex];
-                    direction = (nextPosition - arPosition).normalized;
-                    direction.y = 0f; // Keep horizontal
+                    direction = nextPosition - arPosition;
+                    float mag = direction.magnitude;
+                    if (mag > 0.01f)
+                    {
+                        direction.Normalize();
+                    }
+                    else
+                    {
+                        LogAR($"⚠️ Arrow {i + 1}: Too close to next ({mag:F3}m), using camera forward");
+                    }
+                    direction.y = 0f;
                 }
 
-                // Apply rotation
+                // FIX 1: The rotation logic is updated to correctly combine North alignment, path direction, and user offset.
                 if (direction.sqrMagnitude > 1e-6f)
                 {
-                    Quaternion lookRotation = Quaternion.LookRotation(direction, Vector3.up);
-                    lookRotation *= Quaternion.Euler(0f, arrowYawOffsetDegrees, 0f);
-                    arrow.transform.rotation = lookRotation;
+                    // Quaternion that points the arrow along the path segment (local direction)
+                    Quaternion localRotation = Quaternion.LookRotation(direction.normalized, Vector3.up);
+
+                    // Combine the overall North alignment of the route with the arrow's local direction and the user's manual offset
+                    Quaternion finalRotation = arOriginWorldRot * northAlignment * localRotation * Quaternion.Euler(0f, arrowYawOffsetDegrees, 0f);
+                    arrow.transform.rotation = finalRotation;
+                    LogAR($"Arrow {i + 1} rotation: {finalRotation.eulerAngles} (Dir: {direction})");
                 }
 
-                // Apply color coding
-                Color arrowColor = Color.yellow; // Default
+                Color arrowColor = Color.yellow;
                 if (i == 0)
-                    arrowColor = Color.green; // Start
+                    arrowColor = Color.green;
                 else if (i == selectedRouteIndices.Count - 1)
-                    arrowColor = Color.blue; // End
+                    arrowColor = Color.blue;
 
                 Renderer[] renderers = arrow.GetComponentsInChildren<Renderer>();
                 foreach (var renderer in renderers)
@@ -847,34 +909,27 @@ public void TestIndoorRouteOptimal()
 
                 arrow.SetActive(true);
 
-                // Store references
                 spawnedArrows.Add(arrow);
                 arrowAnchors.Add(anchor);
+
                 activeArrows.Add(arrow);
 
                 spawnedCount++;
                 LogAR($"✅ Arrow {i + 1} spawned successfully");
-                success = true;
             }
             catch (System.Exception e)
             {
                 LogErrorAR($"❌ Exception spawning arrow {i + 1}: {e.Message}");
-
-                // Clean up on failure
-                if (arrow != null)
-                {
-                    DestroyImmediate(arrow);
-                }
-                if (anchorObject != null)
-                {
-                    DestroyImmediate(anchorObject);
-                }
+                if (arrow != null) Destroy(arrow);
+                if (anchor.gameObject != null) Destroy(anchor.gameObject);
             }
 
-            // Yield after each arrow (outside try-catch)
             yield return new WaitForSeconds(0.1f);
         }
-
+        if (spawnedCount != selectedRouteIndices.Count)
+        {
+            LogErrorAR($"⚠️ Spawn mismatch: Expected {selectedRouteIndices.Count}, Spawned {spawnedCount} - Check for duplicates!");
+        }
         arrowsSpawned = true;
         LogAR($"🎉 ARROW SPAWNING COMPLETED: {spawnedCount}/{selectedRouteIndices.Count} arrows created");
         UpdateStatus($"Navigation ready: {spawnedCount} arrows");
@@ -892,7 +947,7 @@ public void TestIndoorRouteOptimal()
 
         // FIXED: For indoor testing, create a much smaller route
         // Instead of 200m real-world route, create a 20m route that scales to 200m
-        double realWorldDistance = 20.0; // meters
+        double realWorldDistance = 50.0; // meters
         double metersPerDegreeLat = 111320.0;
         double metersPerDegreeLon = 111320.0 * System.Math.Cos(start.x * System.Math.PI / 180.0);
 
@@ -988,44 +1043,31 @@ public void TestIndoorRouteOptimal()
             }
         }
     }
-
     private void ClearExistingArrows()
     {
-        LogAR("🧹 Clearing existing arrows...");
+        LogAR($"🧹 Clearing {arrowAnchors.Count} existing arrow anchors...");
 
-        // Clear arrow GameObjects
-        foreach (var arrow in spawnedArrows)
-        {
-            if (arrow != null)
-            {
-                DestroyImmediate(arrow);
-            }
-        }
-
-        // Clear anchors using new approach
+        // By destroying the anchor's parent GameObject, we automatically destroy its child arrow.
+        // This is the cleanest and most efficient way to clear everything.
         foreach (var anchor in arrowAnchors)
         {
             if (anchor != null && anchor.gameObject != null)
             {
-                DestroyImmediate(anchor.gameObject);
+                // FIX 1: Use Destroy() for safe, reliable runtime destruction.
+                Destroy(anchor.gameObject);
             }
         }
 
-        // Clear active arrows
-        foreach (var arrow in activeArrows)
-        {
-            if (arrow != null)
-            {
-                DestroyImmediate(arrow);
-            }
-        }
-
+        // FIX 2: Immediately clear all tracking lists to reset the state for the next run.
         spawnedArrows.Clear();
         arrowAnchors.Clear();
         activeArrows.Clear();
+
+        // This flag is also reset in RequestNavigationRoute's "Master Reset",
+        // but setting it here as well provides extra safety.
         arrowsSpawned = false;
 
-        LogAR("✅ All existing arrows cleared");
+        LogAR("✅ All lists cleared and objects marked for destruction.");
     }
 
     public void UpdateStatus(string status)
