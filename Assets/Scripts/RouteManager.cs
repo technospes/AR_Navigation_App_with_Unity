@@ -883,15 +883,27 @@ public void TestIndoorRouteOptimal()
                 }
 
                 // FIX 1: The rotation logic is updated to correctly combine North alignment, path direction, and user offset.
+                // FIX 1: The rotation logic is updated to correctly combine North alignment, path direction, and user offset.
                 if (direction.sqrMagnitude > 1e-6f)
                 {
-                    // Quaternion that points the arrow along the path segment (local direction)
+                    // --- START: FINAL ROTATION LOGIC ---
+                    // 1. Calculate the local rotation that points the arrow along the path segment.
                     Quaternion localRotation = Quaternion.LookRotation(direction.normalized, Vector3.up);
 
-                    // Combine the overall North alignment of the route with the arrow's local direction and the user's manual offset
-                    Quaternion finalRotation = arOriginWorldRot * northAlignment * localRotation * Quaternion.Euler(0f, arrowYawOffsetDegrees, 0f);
-                    arrow.transform.rotation = finalRotation;
-                    LogAR($"Arrow {i + 1} rotation: {finalRotation.eulerAngles} (Dir: {direction})");
+                    // 2. Combine all rotations for the initial calculation.
+                    Quaternion combinedRotation = arOriginWorldRot * northAlignment * localRotation * Quaternion.Euler(0f, arrowYawOffsetDegrees, 0f);
+
+                    // 3. Extract the "forward" direction from that complex rotation.
+                    Vector3 finalForward = combinedRotation * Vector3.forward;
+
+                    // 4. CRITICAL FIX: Flatten this final direction vector onto the horizontal plane.
+                    finalForward.y = 0;
+
+                    // 5. Create a new, clean rotation from the flattened direction. This removes all unwanted tilt.
+                    arrow.transform.rotation = Quaternion.LookRotation(finalForward.normalized, Vector3.up);
+
+                    LogAR($"Arrow {i + 1} rotation: {arrow.transform.eulerAngles} (Dir: {direction})");
+                    // --- END: FINAL ROTATION LOGIC ---
                 }
 
                 Color arrowColor = Color.yellow;
