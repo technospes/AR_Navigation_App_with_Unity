@@ -1,4 +1,5 @@
-﻿using Mapbox.Directions;
+﻿using System;
+using Mapbox.Directions;
 using Mapbox.Unity;
 using Mapbox.Unity.Location;
 using Mapbox.Unity.Map;
@@ -14,6 +15,8 @@ using System.Linq;
 using Mapbox.MapMatching;
 using System.Globalization;
 using UnityEngine.UIElements;
+using System.Text;
+
 
 #if UNITY_ANDROID
 using UnityEngine.Android;
@@ -21,6 +24,13 @@ using UnityEngine.Android;
 
 public class RouteManager : MonoBehaviour
 {
+    [Header("Dynamic Spawning")]
+    public float spawnAheadDistance = 100f;  // Meters ahead to spawn
+    public float despawnBehindDistance = 20f;  // Meters behind to despawn
+    public float updateDistanceThreshold = 10f;  // Move this far to update
+    private Vector3 lastUserPositionForUpdate;  // Track user pos
+    private int lastClosestRouteIndex = 0;  // Track progress
+    private List<GameObject> managedArrowObjects = new List<GameObject>();  // Track spawned arrows
     [Header("Required Components")]
     [SerializeField] private AbstractMap map;
     public GameObject arrowPrefab;
@@ -47,7 +57,26 @@ public class RouteManager : MonoBehaviour
     public float arrowScale = 0.5f;
     public float arrowHeightOffset = 0.1f;
     public float maxVisibleDistance = 100f;
+    [Header("Navigation Behavior")]
+    public float initialSpawnDistance = 100f;  // Always spawn first 100m
+    public float continuousSpawnAhead = 50f;   // Keep 50m ahead spawned
+    public float arrowDespawnBehind = 15f;     // Remove arrows 15m behind
+    public int minimumVisibleArrows = 8;       // Always show at least 8 arrows
+    public float arrowStabilityRadius = 5f;    // Prevent arrow respawning within this radius
 
+    [Header("On-Screen Debug UI")]
+    public TextMeshProUGUI apiDebugText;
+    public Button testAPIButton;
+    public GameObject debugPanel;
+
+    public enum NavigationMode { Walking, Cycling, Driving }
+    [Header("Route Type Selection")]
+    public NavigationMode currentMode = NavigationMode.Walking;
+    public int maxPointsPerSegment = 200;  // Limit per update for long routes
+
+    // Add these private variables
+    private float totalRouteDistance = 0f;
+    private List<float> cumulativeDistances = new List<float>();
     [Header("Coordinate Conversion")]
     public float mapToARScale = 1f;
     public Vector3 arOriginOffset = Vector3.zero;
@@ -60,7 +89,7 @@ public class RouteManager : MonoBehaviour
     [Header("Route Settings")]
     public bool useTestRoute = false;
     public bool showAllArrows = true;
-
+    public RoutingProfile routeProfile = RoutingProfile.Walking;  // Change via UI later (e.g., dropdown)
     [Header("Visual Feedback")]
     public TextMeshProUGUI statusText;
     public TextMeshProUGUI debugText;
@@ -79,8 +108,8 @@ public class RouteManager : MonoBehaviour
     private List<ARAnchor> arrowAnchors = new List<ARAnchor>();
 
     // GPS coordinates
-    private Vector2d currentPosition = new Vector2d(28.457747632781057, 77.49689444467059);
-    private Vector2d destination = new Vector2d(28.45695439935732, 77.49667533822735);
+    private Vector2d currentPosition = new Vector2d(29.907952863449825, 78.09645393724858);
+    private Vector2d destination = new Vector2d(29.907222551756956, 78.09838079505975);
     private Mapbox.Utils.Vector2d referencePosition;
 
     private Vector3 arOriginWorldPos = Vector3.zero;
@@ -148,6 +177,7 @@ public class RouteManager : MonoBehaviour
         RequestLocationPermission();
         LogAR($"Settings: GPS={useDeviceGPS}, TestRoute={useTestRoute}, Spacing={arrowSpacing}, Scale={mapToARScale}");
         InitializeComponents();
+        lastUserPositionForUpdate = Vector3.zero;
         StartCoroutine(InitializeLocationServices());
     }
 
@@ -156,15 +186,31 @@ public class RouteManager : MonoBehaviour
         UpdateDebugDisplay();
         UpdateUserPosition();
 
-        if (locationInitialized && planeLocked && !routeRequested && !routeReceived && !arrowsSpawned)
+        // Trigger initial route request
+        if (locationInitialized && planeLocked && !routeRequested && !routeReceived)
         {
-            //if (Coroutine.GetInstance().IsRunning(RequestNavigationRoute)) return;  // Skip if already running
-            LogAR("🔍 Update detected ready state - triggering route generation");
-            StartCoroutine(RequestNavigationRoute());
+            LogAR("Ready state detected - starting route generation");
+            StartCoroutine(RequestNavigationRouteWithMode());
         }
 
-        if (arrowsSpawned)
-            UpdateArrowVisibility();
+        // Dynamic arrow management - improved logic
+        if (arrowsSpawned && routeARPositions.Count > 0)
+        {
+            float distanceMoved = Vector3.Distance(userARPosition, lastUserPositionForUpdate);
+
+            // Update more frequently for better responsiveness
+            if (distanceMoved > updateDistanceThreshold * 0.5f) // More sensitive updates
+            {
+                UpdateDynamicArrowSpawning();
+                lastUserPositionForUpdate = userARPosition;
+            }
+
+            // Also update on time intervals for long stationary periods
+            if (Time.time % 5f < Time.deltaTime) // Every 5 seconds
+            {
+                UpdateDynamicArrowSpawning();
+            }
+        }
     }
 
     void OnEnable()
@@ -417,102 +463,54 @@ public class RouteManager : MonoBehaviour
         routeARPositions.Clear();
         selectedRouteIndices.Clear();
 
-        yield return StartCoroutine(RequestNavigationRoute());
+        yield return StartCoroutine(RequestNavigationRouteWithMode());
     }
 
     #endregion
 
     #region Route Management
-
-    private IEnumerator RequestNavigationRoute()
-    {
-        LogAR("=== ENHANCED ROUTE REQUEST START ===");
-        // FIX: Add a master reset here to prevent any old data or objects from persisting.
-        ClearExistingArrows();
-        rawRoutePoints.Clear();
-        routeARPositions.Clear();
-        selectedRouteIndices.Clear();
-        routeReceived = false; // Also reset this flag
-        arrowsSpawned = false;
-
-        if (routeRequested)
-        {
-            LogAR("⚠️ Route already requested, forcing reset...");
-            routeRequested = false;
-        }
-
-        routeRequested = true;
-        LogAR($"🚀 Route request initiated - useTestRoute: {useTestRoute}");
-        LogAR($"📍 From: {currentPosition.x:F6}, {currentPosition.y:F6}");
-        LogAR($"📍 To: {destination.x:F6}, {destination.y:F6}");
-
-        UpdateStatus("Getting route...");
-        bool success = false;
-
-        if (useTestRoute)
-        {
-            // Handle test route (no API call needed)
-            try
-            {
-                LogAR("🧪 ENHANCED: Generating test route...");
-                rawRoutePoints = GenerateTestRoute(currentPosition, destination, 20);
-
-                if (rawRoutePoints != null && rawRoutePoints.Count > 0)
-                {
-                    routeReceived = true;
-                    LogAR($"✅ Route generated: {rawRoutePoints.Count} points");
-                    success = true;
-                }
-                else
-                {
-                    LogErrorAR("❌ Test route generation returned null or empty");
-                    UpdateStatus("Route generation failed");
-                    routeRequested = false;
-                }
-            }
-            catch (System.Exception e)
-            {
-                LogErrorAR($"❌ Exception in test route generation: {e.Message}");
-                routeRequested = false;
-            }
-        }
-        else
-        {
-            // Handle real API call with coroutine
-            yield return StartCoroutine(RequestRealRoute());
-            success = routeReceived;
-        }
-
-        if (success)
-        {
-            LogAR("🎯 Starting ProcessRouteData...");
-            yield return StartCoroutine(ProcessRouteData());
-            LogAR("✅ ProcessRouteData completed");
-        }
-
-        LogAR("=== ROUTE REQUEST COMPLETED ===");
-    }
-
-    private IEnumerator RequestRealRoute()
+    // This is the final, definitive version.
+    // It combines your robust logic with the SDK-compatible API call.
+    private IEnumerator RequestRealRouteWithProfile()
     {
         LogAR("🌐 Querying real Mapbox Directions API...");
-
         bool queryCompleted = false;
         DirectionsResponse apiResponse = null;
         Vector2d[] waypoints = new Vector2d[] { currentPosition, destination };
-        DirectionResource dr = new DirectionResource(waypoints, RoutingProfile.Walking);
+
+        // --- START: SDK v2.1.1 COMPATIBLE SETUP ---
+        // We can only use the properties that exist in your older SDK.
+        DirectionResource dr = new DirectionResource(waypoints, routeProfile);
         dr.Steps = true;
+        dr.Overview = Mapbox.Directions.Overview.Full; // Maximum detail
+                                                       // --- END: SDK v2.1.1 COMPATIBLE SETUP ---
+
+        // Your excellent pre-flight distance check
+        double distance = CalculateDistanceBetweenPoints(currentPosition, destination);
+        LogAR($"Route distance: {distance:F1}m (straight line)");
+        if (distance < 50)
+        {
+            LogAR("⚠️ Route is very short - API may return minimal geometry");
+        }
+
+        LogAR($"API Request details: Profile={routeProfile}, Overview={dr.Overview}");
 
         _directions.Query(dr, (DirectionsResponse res) =>
         {
             apiResponse = res;
             queryCompleted = true;
+            // Your detailed response logging is great and remains here
+            if (res != null && res.Routes != null && res.Routes.Count > 0)
+            {
+                var route = res.Routes[0];
+                LogAR($"API SUCCESS: Received route with {route.Geometry?.Count ?? 0} geometry points");
+            }
+            else { LogErrorAR("API returned null or empty routes"); }
         });
 
         // Wait for the query to complete
-        float timeout = 10f;
+        float timeout = 15f;
         float elapsed = 0f;
-
         while (!queryCompleted && elapsed < timeout)
         {
             elapsed += Time.deltaTime;
@@ -521,110 +519,194 @@ public class RouteManager : MonoBehaviour
 
         if (queryCompleted && apiResponse != null && apiResponse.Routes != null && apiResponse.Routes.Count > 0)
         {
-            rawRoutePoints = apiResponse.Routes[0].Geometry;
-            routeReceived = true;
-            LogAR($"✅ Real route fetched: {rawRoutePoints.Count} points");
+            var route = apiResponse.Routes[0];
+            rawRoutePoints = route.Geometry;
+
+            if (rawRoutePoints != null && rawRoutePoints.Count > 0)
+            {
+                routeReceived = true;
+                LogAR($"✅ Real route fetched: {rawRoutePoints.Count} geometry points");
+
+                // Your excellent post-flight check to enhance sparse routes
+                if (rawRoutePoints.Count <= 5 && route.Legs != null)
+                {
+                    LogAR($"Only {rawRoutePoints.Count} geometry points - attempting to extract from steps...");
+                    List<Vector2d> enhancedPoints = ExtractPointsFromSteps(route);
+                    if (enhancedPoints.Count > rawRoutePoints.Count)
+                    {
+                        LogAR($"SUCCESS: Enhanced route to {enhancedPoints.Count} points from steps!");
+                        rawRoutePoints = enhancedPoints;
+                    }
+                }
+            }
+            else
+            {
+                LogErrorAR("Route geometry is null or empty");
+                routeReceived = false;
+            }
         }
         else
         {
-            LogErrorAR("❌ Real route query failed or timed out - falling back to test route");
-            rawRoutePoints = GenerateTestRoute(currentPosition, destination, 15);
+            LogErrorAR($"Real route query failed or timed out after {elapsed:F1}s");
+            routeReceived = false;
+        }
+
+        // Fallback to test route ONLY if the real route failed
+        if (!routeReceived)
+        {
+            LogAR("Falling back to test route.");
+            rawRoutePoints = GenerateTestRoute(currentPosition, destination, 25);
             routeReceived = (rawRoutePoints != null && rawRoutePoints.Count > 0);
         }
+
+        LogAR($"Final result: {rawRoutePoints?.Count ?? 0} route points, routeReceived: {routeReceived}");
+    }
+
+
+    // Add this NEW helper method to your script
+    private List<Vector2d> ExtractPointsFromSteps(Mapbox.Directions.Route route)
+    {
+        List<Vector2d> points = new List<Vector2d>();
+        if (route.Legs != null)
+        {
+            foreach (var leg in route.Legs)
+            {
+                if (leg.Steps != null)
+                {
+                    foreach (var step in leg.Steps)
+                    {
+                        if (step.Maneuver != null)
+                        {
+                            points.Add(step.Maneuver.Location);
+                        }
+                    }
+                }
+            }
+        }
+        return points;
+    }
+
+
+    // Add this NEW helper method to your script
+    private double CalculateDistanceBetweenPoints(Vector2d point1, Vector2d point2)
+    {
+        double lat1Rad = point1.x * Math.PI / 180.0;
+        double lat2Rad = point2.x * Math.PI / 180.0;
+        double deltaLatRad = (point2.x - point1.x) * Math.PI / 180.0;
+        double deltaLonRad = (point2.y - point1.y) * Math.PI / 180.0;
+
+        double a = Math.Sin(deltaLatRad / 2) * Math.Sin(deltaLatRad / 2) +
+                     Math.Cos(lat1Rad) * Math.Cos(lat2Rad) *
+                     Math.Sin(deltaLonRad / 2) * Math.Sin(deltaLonRad / 2);
+        double c = 2 * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1 - a));
+
+        return 6371000 * c; // Earth radius in meters
     }
 
     // FIXED: ProcessRouteData method
     private IEnumerator ProcessRouteData()
     {
         LogAR("=== ENHANCED ROUTE PROCESSING START ===");
-        LogAR($"📊 Input: {rawRoutePoints.Count} raw GPS points");
 
         if (rawRoutePoints == null || rawRoutePoints.Count == 0)
         {
-            LogErrorAR("❌ No route points to process");
+            LogErrorAR("No route points to process");
             yield break;
         }
 
         routeOrigin = rawRoutePoints[0];
-        LogAR($"📍 Route origin set: {routeOrigin.x:F6}, {routeOrigin.y:F6}");
-
         routeARPositions.Clear();
         selectedRouteIndices.Clear();
         ClearExistingArrows();
-        routeARPositions.Clear();  // Ensure no extras
-        LogAR("🔄 Converting GPS points to AR coordinates...");
 
+        // Convert GPS to AR coordinates
         for (int i = 0; i < rawRoutePoints.Count; i++)
         {
             Vector2d gpsPoint = rawRoutePoints[i];
             Vector3 arPosition = ConvertGPSToAR(gpsPoint);
             routeARPositions.Add(arPosition);
 
-            if (i % 3 == 2) yield return null;
+            if (i % 3 == 2) yield return null; // Prevent frame drops
         }
 
-        LogAR($"✅ Converted {routeARPositions.Count} points to AR coordinates");
-        // FIX: For indoor testing, center the entire route in front of the camera for easy viewing.
-        if (useTestRoute && routeARPositions.Count > 0 && arCamera != null)
+        // Center route for indoor testing
+        if (useTestRoute && routeARPositions.Count > 0)
         {
-            // 1. Calculate the geometric center (centroid) of the route.
-            Vector3 centroid = Vector3.zero;
-            foreach (var pos in routeARPositions)
-            {
-                centroid += pos;
-            }
-            centroid /= routeARPositions.Count;
-            centroid.y = 0f;
-
-            // 2. CORRECTION: The offset is a fixed world distance (3m), so we remove the scale factor.
-            Vector3 cameraForwardOffset = arCamera.transform.forward * 3f;
-            cameraForwardOffset.y = 0f;
-
-            // 3. Get the camera's horizontal rotation.
-            Quaternion cameraYawRot = Quaternion.Euler(0f, arCamera.transform.eulerAngles.y, 0f);
-
-            // 4. Reposition and rotate every point in the route.
-            for (int i = 0; i < routeARPositions.Count; i++)
-            {
-                // Center the route at the world origin
-                routeARPositions[i] -= centroid;
-                // Rotate the route to face the same direction as the camera
-                routeARPositions[i] = cameraYawRot * routeARPositions[i];
-                // Move the now-centered-and-rotated route in front of the camera
-                routeARPositions[i] += cameraForwardOffset;
-            }
-            LogAR($"📍 Route centered and rotated to appear in front of the camera.");
-        }
-        // ===== END OF NEW BLOCK =====
-
-
-        // FIXED: Use proper spacing for indoor testing
-        float actualSpacing = arrowSpacing; // Use the base spacing directly
-
-        if (useTestRoute)
-        {
-            // For indoor testing, we want arrows closer together for better visualization
-            actualSpacing = arrowSpacing; // Keep the 3m spacing you set
-            LogAR($"🏠 Indoor mode: Using {actualSpacing}m spacing for better visualization");
-        }
-        else
-        {
-            actualSpacing = arrowSpacing * 2; // Outdoor can be more spaced
-            LogAR($"🌍 Outdoor mode: Using {actualSpacing}m spacing");
+            CenterRouteForIndoorTesting();
         }
 
-        LogAR($"🎯 Using selection spacing: {actualSpacing}m");
+        // Calculate distances and optimal spacing
+        CalculateOptimalArrowSpacing();
 
-        List<int> selected = SelectRoutePoints(routeARPositions, actualSpacing);
-        selectedRouteIndices = selected;
+        // Use improved selection algorithm
+        selectedRouteIndices = SelectRoutePointsImproved(routeARPositions, arrowSpacing);
 
-        LogAR($"📌 Selected {selectedRouteIndices.Count} points for arrows");
-        UpdateStatus($"Route ready: {selectedRouteIndices.Count} arrows");
+        LogAR($"Route processed: {selectedRouteIndices.Count} arrow positions selected");
+        UpdateStatus($"Route ready: {selectedRouteIndices.Count} arrows planned");
 
-        LogAR("🚀 TRIGGERING ARROW SPAWNING...");
-        yield return StartCoroutine(SpawnNavigationArrowsEnhanced());
+        // Initialize dynamic arrow system
+        arrowsSpawned = true;
+        lastUserPositionForUpdate = userARPosition;
+
+        // Spawn initial arrows
+        SpawnInitialGuidanceArrows();
 
         LogAR("=== ROUTE PROCESSING COMPLETED ===");
+    }
+
+    private void CenterRouteForIndoorTesting()
+    {
+        if (routeARPositions.Count == 0) return;
+
+        // Calculate centroid
+        Vector3 centroid = Vector3.zero;
+        foreach (var pos in routeARPositions)
+        {
+            centroid += pos;
+        }
+        centroid /= routeARPositions.Count;
+        centroid.y = 0f;
+
+        // Position route in front of camera
+        Vector3 cameraForwardOffset = arCamera.transform.forward * 3f;
+        cameraForwardOffset.y = 0f;
+        Quaternion cameraYawRot = Quaternion.Euler(0f, arCamera.transform.eulerAngles.y, 0f);
+
+        // Reposition and rotate every point
+        for (int i = 0; i < routeARPositions.Count; i++)
+        {
+            routeARPositions[i] -= centroid;
+            routeARPositions[i] = cameraYawRot * routeARPositions[i];
+            routeARPositions[i] += cameraForwardOffset;
+        }
+
+        LogAR("Route centered and rotated for indoor testing");
+    }
+    private IEnumerator ProcessInitialSegment()
+    {
+        LogAR("=== PROCESSING INITIAL ROUTE SEGMENT ===");
+
+        if (rawRoutePoints == null || rawRoutePoints.Count == 0)
+        {
+            LogErrorAR("No raw route points to process");
+            yield break;
+        }
+
+        // For outdoor real routes, don't limit the points unless absolutely necessary
+        if (!useTestRoute && rawRoutePoints.Count > maxPointsPerSegment)
+        {
+            LogAR($"Long route detected: {rawRoutePoints.Count} points, processing first {maxPointsPerSegment}");
+            // Keep the full route but process in segments for performance
+            // For now, process all points but we could optimize this later
+        }
+
+        // Process the full route data
+        yield return StartCoroutine(ProcessRouteData());
+
+        // Calculate distances for dynamic spawning
+        CalculateCumulativeDistances();
+
+        LogAR($"Initial segment processed: {routeARPositions.Count} AR positions, {totalRouteDistance:F1}m total");
     }
 
     // FIXED: GPS to AR conversion
@@ -684,7 +766,7 @@ public void TestIndoorRouteOptimal()
     arrowsSpawned = false;
     
     // Start fresh route generation
-    StartCoroutine(RequestNavigationRoute());
+    StartCoroutine(RequestNavigationRouteWithMode());
     
     LogAR("✅ Testing with optimal indoor settings...");
 }
@@ -774,144 +856,675 @@ public void TestIndoorRouteOptimal()
         LogAR($"🎉 SELECTION COMPLETE: {selectedIndices.Count} points selected");
         return selectedIndices;
     }
-
-    // ===== THIS IS THE CORRECTED AND FINAL VERSION =====
-    private IEnumerator SpawnNavigationArrowsEnhanced()
+    private void UpdateDynamicArrowSpawning()
     {
-        LogAR("=== ENHANCED ARROW SPAWNING START ===");
-
-        if (arrowsSpawned)
+        if (routeARPositions == null || routeARPositions.Count < 2 || primaryPlane == null)
         {
-            LogAR("⚠️ Arrows already spawned, clearing first...");
-            ClearExistingArrows();
+            return;
         }
+
+        // Calculate user's progress along the route
+        UserProgressData progress = CalculateUserProgress();
+
+        LogAR($"🔄 Dynamic update: User at {progress.distanceAlongRoute:F1}m along route");
+
+        // Define visibility window based on user's current position
+        float windowStart = Mathf.Max(0, progress.distanceAlongRoute - despawnBehindDistance);
+        float windowEnd = Mathf.Min(totalRouteDistance, progress.distanceAlongRoute + spawnAheadDistance);
+
+        LogAR($"Visibility window: {windowStart:F1}m to {windowEnd:F1}m");
+
+        // Determine which arrows should exist in this window
+        HashSet<int> requiredIndices = new HashSet<int>();
+        float lastSpawnDistance = windowStart - arrowSpacing; // Start before window
+
+        for (int i = 0; i < routeARPositions.Count; i++)
+        {
+            float routeDistance = cumulativeDistances[i];
+
+            // Check if this point is in our visibility window
+            if (routeDistance >= windowStart && routeDistance <= windowEnd)
+            {
+                // Check spacing requirement
+                if (routeDistance - lastSpawnDistance >= arrowSpacing ||
+                    i == 0 || i == routeARPositions.Count - 1) // Always include start/end if in window
+                {
+                    requiredIndices.Add(i);
+                    lastSpawnDistance = routeDistance;
+                    LogAR($"Required arrow at index {i}, distance {routeDistance:F1}m");
+                }
+            }
+        }
+
+        // Ensure minimum arrow count for guidance
+        if (requiredIndices.Count < minimumVisibleArrows)
+        {
+            LogAR($"Only {requiredIndices.Count} arrows planned, ensuring minimum {minimumVisibleArrows}");
+
+            // Expand window or reduce spacing to get more arrows
+            float expandedEnd = Mathf.Min(totalRouteDistance, progress.distanceAlongRoute + spawnAheadDistance * 1.5f);
+            float reducedSpacing = arrowSpacing * 0.6f;
+            lastSpawnDistance = windowStart - reducedSpacing;
+
+            for (int i = 0; i < routeARPositions.Count && requiredIndices.Count < minimumVisibleArrows; i++)
+            {
+                float routeDistance = cumulativeDistances[i];
+
+                if (routeDistance >= windowStart && routeDistance <= expandedEnd)
+                {
+                    if (routeDistance - lastSpawnDistance >= reducedSpacing)
+                    {
+                        if (!requiredIndices.Contains(i))
+                        {
+                            requiredIndices.Add(i);
+                            lastSpawnDistance = routeDistance;
+                            LogAR($"Added extra arrow at index {i} for minimum count");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remove arrows that shouldn't exist anymore
+        List<GameObject> arrowsToRemove = new List<GameObject>();
+        foreach (var arrow in managedArrowObjects.ToList()) // ToList() to avoid modification during iteration
+        {
+            if (arrow != null)
+            {
+                ArrowMetadata metadata = arrow.GetComponent<ArrowMetadata>();
+                if (metadata != null)
+                {
+                    if (!requiredIndices.Contains(metadata.RouteIndex))
+                    {
+                        arrowsToRemove.Add(arrow);
+                        LogAR($"Marking arrow {metadata.RouteIndex} for removal (distance: {metadata.DistanceFromStart:F1}m)");
+                    }
+                }
+            }
+            else
+            {
+                // Remove null references
+                arrowsToRemove.Add(arrow);
+            }
+        }
+
+        // Remove obsolete arrows
+        foreach (var arrow in arrowsToRemove)
+        {
+            RemoveArrow(arrow);
+        }
+
+        // Spawn new arrows that should exist
+        List<int> newIndices = new List<int>();
+        foreach (int index in requiredIndices)
+        {
+            bool exists = false;
+            foreach (var arrow in managedArrowObjects)
+            {
+                if (arrow != null)
+                {
+                    ArrowMetadata metadata = arrow.GetComponent<ArrowMetadata>();
+                    if (metadata != null && metadata.RouteIndex == index)
+                    {
+                        exists = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!exists)
+            {
+                newIndices.Add(index);
+            }
+        }
+
+        // Spawn new arrows
+        if (newIndices.Count > 0)
+        {
+            LogAR($"Spawning {newIndices.Count} new arrows");
+            StartCoroutine(SpawnArrowsFromIndices(newIndices));
+        }
+
+        LogAR($"Dynamic update complete: {managedArrowObjects.Count} total arrows active");
+    }
+    private void RemoveArrow(GameObject arrow)
+    {
+        if (arrow == null) return;
+
+        // Get metadata for logging
+        ArrowMetadata metadata = arrow.GetComponent<ArrowMetadata>();
+        int routeIndex = metadata != null ? metadata.RouteIndex : -1;
+
+        LogAR($"Removing arrow {routeIndex}");
+
+        // Remove from all tracking lists
+        managedArrowObjects.Remove(arrow);
+        activeArrows.Remove(arrow);
+        spawnedArrows.Remove(arrow);
+
+        // Find and remove the corresponding anchor
+        Transform anchorTransform = arrow.transform.parent;
+        if (anchorTransform != null)
+        {
+            ARAnchor anchor = anchorTransform.GetComponent<ARAnchor>();
+            if (anchor != null)
+            {
+                arrowAnchors.Remove(anchor);
+                LogAR($"Destroying anchor for arrow {routeIndex}");
+            }
+
+            // Destroy the entire anchor object (which includes the arrow)
+            Destroy(anchorTransform.gameObject);
+        }
+        else
+        {
+            // If somehow the arrow has no parent anchor, destroy it directly
+            LogAR($"Warning: Arrow {routeIndex} has no parent anchor, destroying directly");
+            Destroy(arrow);
+        }
+    }
+    private List<int> SelectRoutePointsImproved(List<Vector3> arPositions, float minSpacing)
+    {
+        List<int> selectedIndices = new List<int>();
+
+        if (arPositions.Count == 0) return selectedIndices;
+
+        // Calculate cumulative distances
+        List<float> cumDistances = new List<float> { 0f };
+        for (int i = 1; i < arPositions.Count; i++)
+        {
+            float distance = Vector3.Distance(arPositions[i], arPositions[i - 1]);
+            cumDistances.Add(cumDistances[i - 1] + distance);
+        }
+
+        float totalDistance = cumDistances[cumDistances.Count - 1];
+
+        // Always include start point
+        selectedIndices.Add(0);
+
+        // Select points based on distance intervals
+        float currentTargetDistance = minSpacing;
+        int lastSelectedIndex = 0;
+
+        for (int i = 1; i < arPositions.Count - 1; i++)
+        {
+            if (cumDistances[i] >= currentTargetDistance &&
+                i > lastSelectedIndex + 1) // Ensure we don't select consecutive points
+            {
+                selectedIndices.Add(i);
+                lastSelectedIndex = i;
+                currentTargetDistance = cumDistances[i] + minSpacing;
+
+                if (selectedIndices.Count >= maxArrows - 1) break; // Save space for end point
+            }
+        }
+
+        // Always include end point
+        if (selectedIndices[selectedIndices.Count - 1] != arPositions.Count - 1)
+        {
+            selectedIndices.Add(arPositions.Count - 1);
+        }
+
+        LogAR($"Route selection: {selectedIndices.Count} points selected from {arPositions.Count} total");
+        return selectedIndices;
+    }
+
+    private IEnumerator RequestNavigationRouteWithMode()
+    {
+        LogAR("=== ROUTE REQUEST WITH NAVIGATION MODE ===");
+
+        // Clear existing state
+        ClearExistingArrows();
+        rawRoutePoints.Clear();
+        routeARPositions.Clear();
+        selectedRouteIndices.Clear();
+        routeReceived = false;
+        arrowsSpawned = false;
+
+        routeRequested = true;
+        UpdateStatus($"Getting {currentMode} route...");
+
+        bool success = false;
+
+        if (useTestRoute)
+        {
+            // Generate test route based on mode
+            int pointCount = GetPointCountForMode(currentMode);
+            rawRoutePoints = GenerateTestRouteForMode(currentPosition, destination, pointCount, currentMode);
+
+            if (rawRoutePoints != null && rawRoutePoints.Count > 0)
+            {
+                routeReceived = true;
+                success = true;
+                LogAR($"Test route generated: {rawRoutePoints.Count} points for {currentMode} mode");
+            }
+        }
+        else
+        {
+            // Real API call with correct routing profile
+            yield return StartCoroutine(RequestRealRouteWithProfile());
+            success = routeReceived;
+        }
+
+        if (success)
+        {
+            yield return StartCoroutine(ProcessInitialSegment());
+        }
+
+        LogAR("=== ROUTE REQUEST COMPLETED ===");
+    }
+    [System.Serializable]
+    public class UserProgressData
+    {
+        public float distanceAlongRoute;
+        public int nearestRouteIndex;
+        public Vector3 projectedPosition;
+        public float distanceFromRoute;
+    }
+
+    [System.Serializable]
+    public class ArrowSpawnData
+    {
+        public int routeIndex;
+        public Vector3 arPosition;
+        public Vector3 worldPosition;
+        public Vector2d gpsPosition;
+        public float distanceFromStart;
+        public Vector3 direction;
+        public bool shouldExist;
+    }
+
+    private UserProgressData CalculateUserProgress()
+    {
+        UserProgressData progress = new UserProgressData();
+        float closestDistance = float.MaxValue;
+
+        Vector3 userPosFlat = new Vector3(userARPosition.x, 0, userARPosition.z);
+
+        for (int i = 0; i < routeARPositions.Count - 1; i++)
+        {
+            Vector3 segmentStart = new Vector3(routeARPositions[i].x, 0, routeARPositions[i].z);
+            Vector3 segmentEnd = new Vector3(routeARPositions[i + 1].x, 0, routeARPositions[i + 1].z);
+
+            Vector3 closestPoint = FindNearestPointOnLine(segmentStart, segmentEnd, userPosFlat);
+            float distance = Vector3.Distance(userPosFlat, closestPoint);
+
+            if (distance < closestDistance)
+            {
+                closestDistance = distance;
+                progress.nearestRouteIndex = i;
+                progress.projectedPosition = closestPoint;
+                progress.distanceFromRoute = distance;
+
+                // Calculate distance along route
+                progress.distanceAlongRoute = cumulativeDistances[i] +
+                    Vector3.Distance(segmentStart, closestPoint);
+            }
+        }
+
+        return progress;
+    }
+
+    private Vector3 CalculateStableWorldPosition(Vector3 arPosition)
+    {
+        // Convert AR position to stable world position
+        Vector3 worldPos = primaryPlane.transform.TransformPoint(arPosition);
+
+        // Project onto detected ground plane using raycast
+        Vector2 screenPoint = arCamera.WorldToScreenPoint(worldPos);
+        List<ARRaycastHit> hits = new List<ARRaycastHit>();
+
+        if (raycastManager.Raycast(screenPoint, hits, TrackableType.Planes))
+        {
+            worldPos = hits[0].pose.position;
+            worldPos.y += arrowHeightOffset;
+        }
+        else
+        {
+            // Fallback to plane height
+            worldPos.y = primaryPlane.transform.position.y + arrowHeightOffset;
+        }
+
+        return worldPos;
+    }
+
+    private Vector3 CalculateArrowDirection(int routeIndex)
+    {
+        Vector3 direction = arCamera.transform.forward; // Fallback
+
+        if (routeIndex < routeARPositions.Count - 1)
+        {
+            Vector3 current = routeARPositions[routeIndex];
+            Vector3 next = routeARPositions[routeIndex + 1];
+
+            direction = (next - current).normalized;
+            direction.y = 0f; // Keep horizontal
+
+            if (direction.magnitude < 0.1f)
+            {
+                // Look ahead further if points are too close
+                for (int i = routeIndex + 2; i < Mathf.Min(routeIndex + 5, routeARPositions.Count); i++)
+                {
+                    Vector3 futurePoint = routeARPositions[i];
+                    direction = (futurePoint - current).normalized;
+                    direction.y = 0f;
+
+                    if (direction.magnitude > 0.1f) break;
+                }
+            }
+        }
+
+        return direction;
+    }
+    private List<Vector2d> GenerateTestRouteForMode(Vector2d start, Vector2d end, int totalPoints, NavigationMode mode)
+    {
+        List<Vector2d> route = new List<Vector2d>();
+
+        // Adjust route characteristics based on mode
+        double routeDistance = GetDistanceForMode(mode);
+        double complexity = GetComplexityForMode(mode);
+
+        double metersPerDegreeLat = 111320.0;
+        double metersPerDegreeLon = 111320.0 * System.Math.Cos(start.x * System.Math.PI / 180.0);
+
+        double latRange = routeDistance / metersPerDegreeLat;
+        double lonRange = routeDistance / metersPerDegreeLon;
+
+        LogAR($"Generating {mode} route: {routeDistance}m distance, {complexity} complexity");
+
+        route.Add(start);
+
+        for (int i = 1; i < totalPoints - 1; i++)
+        {
+            float progress = (float)i / (totalPoints - 1);
+            Vector2d point;
+
+            if (mode == NavigationMode.Walking)
+            {
+                // Walking routes can have more turns and shortcuts
+                if (progress <= 0.7f)
+                {
+                    float segmentProgress = progress / 0.7f;
+                    point = new Vector2d(
+                        start.x + latRange * 0.6 * segmentProgress,
+                        start.y + lonRange * 0.3 * segmentProgress
+                    );
+                }
+                else
+                {
+                    float segmentProgress = (progress - 0.7f) / 0.3f;
+                    Vector2d segmentStart = new Vector2d(start.x + latRange * 0.6, start.y + lonRange * 0.3);
+                    point = new Vector2d(
+                        segmentStart.x + latRange * 0.4 * segmentProgress,
+                        segmentStart.y + lonRange * 0.7 * segmentProgress
+                    );
+                }
+            }
+            else if (mode == NavigationMode.Cycling)
+            {
+                // Cycling routes prefer bike lanes and smoother turns
+                point = new Vector2d(
+                    start.x + latRange * progress,
+                    start.y + lonRange * progress * 0.8
+                );
+            }
+            else // Driving
+            {
+                // Driving routes follow roads more strictly
+                point = new Vector2d(
+                    start.x + latRange * progress * 0.9,
+                    start.y + lonRange * progress
+                );
+            }
+
+            route.Add(point);
+        }
+
+        // Adjust end point based on mode
+        Vector2d adjustedEnd = new Vector2d(
+            start.x + latRange,
+            start.y + lonRange
+        );
+        route.Add(adjustedEnd);
+
+        return route;
+    }
+    private int GetPointCountForMode(NavigationMode mode)
+    {
+        switch (mode)
+        {
+            case NavigationMode.Walking: return 25; // More detailed for walking
+            case NavigationMode.Cycling: return 20; // Medium detail
+            case NavigationMode.Driving: return 15; // Less detail for driving
+            default: return 20;
+        }
+    }
+    private double GetDistanceForMode(NavigationMode mode)
+    {
+        switch (mode)
+        {
+            case NavigationMode.Walking: return 150.0; // Shorter walking routes
+            case NavigationMode.Cycling: return 300.0; // Medium cycling routes  
+            case NavigationMode.Driving: return 500.0; // Longer driving routes
+            default: return 200.0;
+        }
+    }
+    private double GetComplexityForMode(NavigationMode mode)
+    {
+        switch (mode)
+        {
+            case NavigationMode.Walking: return 1.0; // Can take shortcuts
+            case NavigationMode.Cycling: return 0.8; // Some restrictions
+            case NavigationMode.Driving: return 0.6; // Must follow roads
+            default: return 1.0;
+        }
+    }
+    private void CalculateOptimalArrowSpacing()
+    {
+        if (totalRouteDistance <= 0) return;
+
+        // Adjust spacing based on route length and navigation mode
+        float baseSpacing = arrowSpacing;
+
+        if (totalRouteDistance < 100f)
+        {
+            // Short routes need closer arrows
+            arrowSpacing = Mathf.Max(baseSpacing * 0.5f, 2f);
+        }
+        else if (totalRouteDistance > 1000f)
+        {
+            // Long routes can have wider spacing
+            arrowSpacing = baseSpacing * 1.5f;
+        }
+
+        // Mode-specific adjustments
+        switch (currentMode)
+        {
+            case NavigationMode.Walking:
+                arrowSpacing *= 0.8f; // Closer for walking
+                break;
+            case NavigationMode.Cycling:
+                arrowSpacing *= 1.0f; // Normal spacing
+                break;
+            case NavigationMode.Driving:
+                arrowSpacing *= 1.3f; // Wider for driving
+                break;
+        }
+
+        LogAR($"Optimal arrow spacing calculated: {arrowSpacing:F1}m for {currentMode} mode");
+    }
+    public static Vector3 FindNearestPointOnLine(Vector3 origin, Vector3 end, Vector3 point)
+    {
+        Vector3 heading = end - origin;
+        float magnitudeMax = heading.magnitude;
+        heading.Normalize();
+
+        Vector3 lhs = point - origin;
+        float dotP = Vector3.Dot(lhs, heading);
+        dotP = Mathf.Clamp(dotP, 0f, magnitudeMax);
+        return origin + heading * dotP;
+    }
+
+    private void SpawnInitialGuidanceArrows()
+    {
+        LogAR("=== SPAWNING INITIAL GUIDANCE ARROWS ===");
+
+        // Calculate cumulative distances for the entire route
+        CalculateCumulativeDistances();
+
+        if (routeARPositions.Count == 0)
+        {
+            LogErrorAR("No route positions available for arrow spawning");
+            return;
+        }
+
+        // Clear any existing arrows first
+        ClearExistingArrows();
+
+        // Calculate how many arrows we should spawn initially
+        int targetArrowCount = Mathf.Max(minimumVisibleArrows, 8); // Ensure good visibility
+        targetArrowCount = Mathf.Min(targetArrowCount, maxArrows); // Don't exceed max
+
+        List<int> initialIndices = new List<int>();
+
+        // Always include start point
+        initialIndices.Add(0);
+
+        // Calculate optimal spacing for initial arrows
+        float effectiveSpacing = arrowSpacing;
+
+        // If we have a long route, we might need to adjust spacing to get enough initial arrows
+        if (totalRouteDistance > initialSpawnDistance)
+        {
+            int maxPossibleArrows = Mathf.FloorToInt(initialSpawnDistance / arrowSpacing);
+            if (maxPossibleArrows < targetArrowCount)
+            {
+                effectiveSpacing = initialSpawnDistance / targetArrowCount;
+                LogAR($"Adjusting initial spacing to {effectiveSpacing:F1}m to fit {targetArrowCount} arrows");
+            }
+        }
+
+        float lastSpawnedDistance = 0f;
+
+        // Add arrows within initial spawn distance
+        for (int i = 1; i < routeARPositions.Count; i++)
+        {
+            float currentDistance = cumulativeDistances[i];
+
+            // Stop if we've exceeded initial spawn distance and have minimum arrows
+            if (currentDistance > initialSpawnDistance && initialIndices.Count >= minimumVisibleArrows)
+                break;
+
+            // Check spacing requirement
+            float distanceFromLast = currentDistance - lastSpawnedDistance;
+            if (distanceFromLast >= effectiveSpacing)
+            {
+                initialIndices.Add(i);
+                lastSpawnedDistance = currentDistance;
+
+                LogAR($"Added initial arrow at index {i}, distance {currentDistance:F1}m");
+
+                // Stop if we have enough arrows
+                if (initialIndices.Count >= targetArrowCount) break;
+            }
+        }
+
+        // Ensure we have the destination arrow if route is short
+        int lastIndex = routeARPositions.Count - 1;
+        if (!initialIndices.Contains(lastIndex) && cumulativeDistances[lastIndex] <= initialSpawnDistance * 1.2f)
+        {
+            initialIndices.Add(lastIndex);
+        }
+
+        LogAR($"Initial spawn plan: {initialIndices.Count} arrows planned");
+
+        // Spawn the arrows synchronously for immediate visibility
+        StartCoroutine(SpawnArrowsFromIndices(initialIndices));
+    }
+    private IEnumerator SpawnArrowsFromIndices(List<int> indices)
+    {
+        LogAR($"=== SPAWNING ARROWS FROM {indices.Count} INDICES ===");
 
         if (primaryPlane == null)
         {
-            LogErrorAR("❌ Primary plane is NULL - cannot spawn arrows");
+            LogErrorAR("Primary plane is null - cannot spawn arrows");
             yield break;
         }
 
         if (arrowPrefab == null)
         {
-            LogErrorAR("❌ Arrow prefab is NULL - check assignment in inspector");
+            LogErrorAR("Arrow prefab is null - check inspector assignment");
             yield break;
         }
 
-        if (selectedRouteIndices.Count == 0)
+        int successfulSpawns = 0;
+
+        for (int i = 0; i < indices.Count; i++)
         {
-            LogErrorAR("❌ No selected route points for arrow placement");
-            yield break;
-        }
+            int routeIndex = indices[i];
 
-        LogAR($"🏗️ Spawning {selectedRouteIndices.Count} arrows...");
-        int spawnedCount = 0;
-
-        for (int i = 0; i < selectedRouteIndices.Count; i++)
-        {
-            bool success = false;
-            string errorMessage = "";
-
-            int routeIndex = selectedRouteIndices[i];
-            Vector3 arPosition = routeARPositions[routeIndex];
-
-            LogAR($"🎯 Spawning arrow {i + 1}/{selectedRouteIndices.Count}");
-
-            Vector3 worldPosition = primaryPlane.transform.TransformPoint(arPosition);
-            worldPosition.y = primaryPlane.transform.position.y + arrowHeightOffset;
-
-            GameObject anchorObject = null;
-            ARAnchor anchor = null;
-
-            try
+            if (routeIndex >= routeARPositions.Count)
             {
-                anchorObject = new GameObject($"NavArrowAnchor_{i + 1}");
-                anchorObject.transform.position = worldPosition;
-                anchorObject.transform.rotation = Quaternion.identity;
-                anchor = anchorObject.AddComponent<ARAnchor>();
-
-                if (anchor != null)
-                {
-                    success = true;
-                }
-                else
-                {
-                    errorMessage = "Failed to create ARAnchor component";
-                }
-            }
-            catch (System.Exception e)
-            {
-                errorMessage = $"Exception creating anchor: {e.Message}";
-            }
-
-            if (!success)
-            {
-                LogErrorAR($"❌ Failed to create anchor for arrow {i + 1}: {errorMessage}");
-                if (anchorObject != null)
-                {
-                    // FIX 2: Replaced DestroyImmediate with Destroy for safer runtime behavior.
-                    Destroy(anchorObject);
-                }
+                LogErrorAR($"Invalid route index: {routeIndex}");
                 continue;
             }
 
+            Vector3 arPosition = routeARPositions[routeIndex];
+
+            // Project position onto the ground plane with raycast
+            Vector3 worldPosition = ProjectPositionToGround(arPosition);
+
+            // Move try-catch outside the yield-containing code
+            GameObject anchorObject = null;
+            ARAnchor anchor = null;
             GameObject arrow = null;
-            try
+            bool spawnSuccess = false;
+
+            // Create anchor object
+            anchorObject = new GameObject($"NavArrowAnchor_{routeIndex}");
+            anchorObject.transform.position = worldPosition;
+            anchorObject.transform.rotation = Quaternion.identity;
+
+            anchor = anchorObject.AddComponent<ARAnchor>();
+            if (anchor == null)
             {
-                arrow = Instantiate(arrowPrefab, anchor.transform);
-                arrow.name = $"NavArrow_{i + 1}";
+                LogErrorAR($"Failed to create anchor for arrow {routeIndex}");
+                if (anchorObject != null) Destroy(anchorObject);
+                continue;
+            }
+
+            // Create arrow as child of anchor
+            arrow = Instantiate(arrowPrefab, anchor.transform);
+            if (arrow != null)
+            {
+                arrow.name = $"NavArrow_{routeIndex}";
                 arrow.transform.localPosition = Vector3.zero;
                 arrow.transform.localScale = Vector3.one * arrowScale;
 
-                // Calculate direction
-                Vector3 direction = arCamera.transform.forward;  // Fallback to camera forward if too close/compass fails
-                if (i < selectedRouteIndices.Count - 1)
+                // Calculate direction for arrow rotation
+                // --- FINAL ROTATION LOGIC (Fixes model orientation AND keeps it flat) ---
+                Vector3 direction = CalculateArrowDirection(routeIndex);
+                if (direction.sqrMagnitude > 0.01f)
                 {
-                    int nextIndex = selectedRouteIndices[i + 1];
-                    Vector3 nextPosition = routeARPositions[nextIndex];
-                    direction = nextPosition - arPosition;
-                    float mag = direction.magnitude;
-                    if (mag > 0.01f)
-                    {
-                        direction.Normalize();
-                    }
-                    else
-                    {
-                        LogAR($"⚠️ Arrow {i + 1}: Too close to next ({mag:F3}m), using camera forward");
-                    }
-                    direction.y = 0f;
+                    // 1. Get the rotation that points the arrow along the path
+                    Quaternion pathRotation = Quaternion.LookRotation(direction.normalized, Vector3.up);
+
+                    // 2. IMPORTANT: Create a correction for models that point UP (Y-axis) instead of FORWARD (Z-axis)
+                    Quaternion modelCorrection = Quaternion.FromToRotation(Vector3.up, Vector3.forward);
+
+                    // 3. Get the user's manual offset (should be 0)
+                    Quaternion userOffset = Quaternion.Euler(0f, arrowYawOffsetDegrees, 0f);
+
+                    // 4. Combine all rotations: First apply the main path rotation, THEN the model correction
+                    arrow.transform.rotation = primaryPlane.transform.rotation * pathRotation * modelCorrection * userOffset;
                 }
 
-                // FIX 1: The rotation logic is updated to correctly combine North alignment, path direction, and user offset.
-                // FIX 1: The rotation logic is updated to correctly combine North alignment, path direction, and user offset.
-                if (direction.sqrMagnitude > 1e-6f)
-                {
-                    // --- START: FINAL ROTATION LOGIC ---
-                    // 1. Calculate the local rotation that points the arrow along the path segment.
-                    Quaternion localRotation = Quaternion.LookRotation(direction.normalized, Vector3.up);
-
-                    // 2. Combine all rotations for the initial calculation.
-                    Quaternion combinedRotation = arOriginWorldRot * northAlignment * localRotation * Quaternion.Euler(0f, arrowYawOffsetDegrees, 0f);
-
-                    // 3. Extract the "forward" direction from that complex rotation.
-                    Vector3 finalForward = combinedRotation * Vector3.forward;
-
-                    // 4. CRITICAL FIX: Flatten this final direction vector onto the horizontal plane.
-                    finalForward.y = 0;
-
-                    // 5. Create a new, clean rotation from the flattened direction. This removes all unwanted tilt.
-                    arrow.transform.rotation = Quaternion.LookRotation(finalForward.normalized, Vector3.up);
-
-                    LogAR($"Arrow {i + 1} rotation: {arrow.transform.eulerAngles} (Dir: {direction})");
-                    // --- END: FINAL ROTATION LOGIC ---
-                }
-
+                // Set appropriate color
                 Color arrowColor = Color.yellow;
-                if (i == 0)
-                    arrowColor = Color.green;
-                else if (i == selectedRouteIndices.Count - 1)
-                    arrowColor = Color.blue;
+                if (routeIndex == 0) arrowColor = Color.green;
+                else if (routeIndex == routeARPositions.Count - 1) arrowColor = Color.blue;
 
+                // Apply color to all renderers
                 Renderer[] renderers = arrow.GetComponentsInChildren<Renderer>();
                 foreach (var renderer in renderers)
                 {
@@ -919,32 +1532,94 @@ public void TestIndoorRouteOptimal()
                     renderer.material.color = arrowColor;
                 }
 
-                arrow.SetActive(true);
+                // Add metadata component
+                ArrowMetadata metadata = arrow.AddComponent<ArrowMetadata>();
+                metadata.RouteIndex = routeIndex;
+                metadata.DistanceFromStart = cumulativeDistances[routeIndex];
+                metadata.StableWorldPosition = worldPosition;
+                metadata.LastUpdateTime = Time.time;
 
-                spawnedArrows.Add(arrow);
+                // Track the arrow
+                managedArrowObjects.Add(arrow);
                 arrowAnchors.Add(anchor);
-
                 activeArrows.Add(arrow);
+                spawnedArrows.Add(arrow);
 
-                spawnedCount++;
-                LogAR($"✅ Arrow {i + 1} spawned successfully");
+                successfulSpawns++;
+                spawnSuccess = true;
+                LogAR($"✅ Arrow {routeIndex} spawned at distance {metadata.DistanceFromStart:F1}m");
             }
-            catch (System.Exception e)
+
+            if (!spawnSuccess)
             {
-                LogErrorAR($"❌ Exception spawning arrow {i + 1}: {e.Message}");
+                LogErrorAR($"Failed to spawn arrow {routeIndex}");
                 if (arrow != null) Destroy(arrow);
-                if (anchor.gameObject != null) Destroy(anchor.gameObject);
+                if (anchorObject != null) Destroy(anchorObject);
             }
 
-            yield return new WaitForSeconds(0.1f);
+            // Small delay to prevent frame drops - moved outside try-catch
+            yield return new WaitForSeconds(0.05f);
         }
-        if (spawnedCount != selectedRouteIndices.Count)
-        {
-            LogErrorAR($"⚠️ Spawn mismatch: Expected {selectedRouteIndices.Count}, Spawned {spawnedCount} - Check for duplicates!");
-        }
+
         arrowsSpawned = true;
-        LogAR($"🎉 ARROW SPAWNING COMPLETED: {spawnedCount}/{selectedRouteIndices.Count} arrows created");
-        UpdateStatus($"Navigation ready: {spawnedCount} arrows");
+        LogAR($"✅ Initial arrow spawning complete: {successfulSpawns}/{indices.Count} arrows spawned");
+        UpdateStatus($"Navigation ready: {successfulSpawns} arrows visible");
+    }
+    private Vector3 ProjectPositionToGround(Vector3 arPosition)
+    {
+        // Transform AR position to world space
+        Vector3 worldPos = primaryPlane.transform.TransformPoint(arPosition);
+
+        // Create a ray from high above the target position downward
+        Vector3 rayStart = worldPos + Vector3.up * 10f;
+        Vector3 rayDirection = Vector3.down;
+
+        // Try raycast to ground first
+        RaycastHit hit;
+        if (Physics.Raycast(rayStart, rayDirection, out hit, 20f))
+        {
+            Vector3 groundPos = hit.point;
+            groundPos.y += arrowHeightOffset;
+            LogAR($"Ground raycast hit at: {groundPos} (height: {groundPos.y:F2})");
+            return groundPos;
+        }
+
+        // Fallback: Try AR raycast from camera to the approximate screen position
+        Vector3 screenPos = arCamera.WorldToScreenPoint(worldPos);
+        if (screenPos.x >= 0 && screenPos.x <= Screen.width &&
+            screenPos.y >= 0 && screenPos.y <= Screen.height && screenPos.z > 0)
+        {
+            List<ARRaycastHit> arHits = new List<ARRaycastHit>();
+            if (raycastManager.Raycast(new Vector2(screenPos.x, screenPos.y), arHits, TrackableType.Planes))
+            {
+                Vector3 arGroundPos = arHits[0].pose.position;
+                arGroundPos.y += arrowHeightOffset;
+                LogAR($"AR raycast hit at: {arGroundPos} (height: {arGroundPos.y:F2})");
+                return arGroundPos;
+            }
+        }
+
+        // Final fallback: Use primary plane height
+        Vector3 fallbackPos = worldPos;
+        fallbackPos.y = primaryPlane.transform.position.y + arrowHeightOffset;
+        LogAR($"Using fallback plane height: {fallbackPos} (plane Y: {primaryPlane.transform.position.y:F2})");
+
+        return fallbackPos;
+    }
+    private void CalculateCumulativeDistances()
+    {
+        cumulativeDistances.Clear();
+        cumulativeDistances.Add(0f);
+        totalRouteDistance = 0f;
+
+        for (int i = 1; i < routeARPositions.Count; i++)
+        {
+            float segmentDistance = Vector3.Distance(routeARPositions[i], routeARPositions[i - 1]);
+            totalRouteDistance += segmentDistance;
+            cumulativeDistances.Add(totalRouteDistance);
+        }
+
+        LogAR($"Route analysis: Total distance {totalRouteDistance:F1}m across {routeARPositions.Count} points");
     }
 
     private List<Vector2d> GenerateTestRoute(Vector2d start, Vector2d end, int totalPoints)
@@ -1023,11 +1698,235 @@ public void TestIndoorRouteOptimal()
 
         return route;
     }
+    [ContextMenu("Debug API Response Raw")]
+    public void DebugAPIResponseRaw()
+    {
+        StartCoroutine(TestAPIResponseRaw());
+    }
+
+    private IEnumerator TestAPIResponseRaw()
+    {
+        LogAR("=== TESTING RAW API RESPONSE ===");
+
+        Vector2d[] waypoints = new Vector2d[] { currentPosition, destination };
+        DirectionResource dr = new DirectionResource(waypoints, RoutingProfile.Walking);
+        dr.Steps = true;
+        dr.Overview = Mapbox.Directions.Overview.Full;
+
+        bool completed = false;
+        DirectionsResponse response = null;
+
+        _directions.Query(dr, (DirectionsResponse res) =>
+        {
+            response = res;
+            completed = true;
+        });
+
+        yield return new WaitUntil(() => completed);
+
+        if (response != null && response.Routes != null && response.Routes.Count > 0)
+        {
+            var route = response.Routes[0];
+            LogAR($"Raw API Response:");
+            LogAR($"  Routes count: {response.Routes.Count}");
+            LogAR($"  Geometry points: {route.Geometry?.Count ?? 0}");
+            LogAR($"  Distance: {route.Distance}m");
+            LogAR($"  Duration: {route.Duration}s");
+
+            if (route.Geometry != null)
+            {
+                LogAR($"First 10 geometry points:");
+                for (int i = 0; i < Math.Min(10, route.Geometry.Count); i++)
+                {
+                    var point = route.Geometry[i];
+                    LogAR($"    [{i}]: {point.x:F8}, {point.y:F8}");
+                }
+            }
+
+            if (route.Legs != null && route.Legs.Count > 0)
+            {
+                var leg = route.Legs[0];
+                LogAR($"  Steps in first leg: {leg.Steps?.Count ?? 0}");
+                if (leg.Steps != null)
+                {
+                    for (int i = 0; i < Math.Min(5, leg.Steps.Count); i++)
+                    {
+                        var step = leg.Steps[i];
+                        LogAR($"    Step {i}: {step.Maneuver?.Location.x:F8}, {step.Maneuver?.Location.y:F8}");
+                    }
+                }
+            }
+        }
+        else
+        {
+            LogErrorAR("API call failed or returned no routes");
+        }
+    }
+    public void SetNavigationMode(NavigationMode mode)
+    {
+        if (currentMode != mode)
+        {
+            currentMode = mode;
+            routeProfile = GetRoutingProfile(mode);
+
+            LogAR($"Navigation mode changed to: {mode}");
+            UpdateStatus($"Mode: {mode} - Recalculating route...");
+
+            // Trigger route recalculation
+            RestartNavigation();
+        }
+    }
+
+    private RoutingProfile GetRoutingProfile(NavigationMode mode)
+    {
+        switch (mode)
+        {
+            case NavigationMode.Walking: return RoutingProfile.Walking;
+            case NavigationMode.Cycling: return RoutingProfile.Cycling;
+            case NavigationMode.Driving: return RoutingProfile.Driving;
+            default: return RoutingProfile.Walking;
+        }
+    }
 
     #endregion
 
     #region Utility Methods
 
+    [ContextMenu("Debug API Response On-Screen")]
+    public void DebugAPIResponseOnScreen()
+    {
+        StartCoroutine(TestAPIResponseOnScreen());
+    }
+
+    private IEnumerator TestAPIResponseOnScreen()
+    {
+        if (apiDebugText == null)
+        {
+            LogErrorAR("apiDebugText is not assigned in inspector!");
+            yield break;
+        }
+
+        UpdateAPIDebugText("=== TESTING RAW API RESPONSE ===\nInitializing...");
+
+        Vector2d[] waypoints = new Vector2d[] { currentPosition, destination };
+        DirectionResource dr = new DirectionResource(waypoints, RoutingProfile.Walking);
+        dr.Steps = true;
+        dr.Overview = Mapbox.Directions.Overview.Full;
+
+        UpdateAPIDebugText("API Request sent...\nWaiting for response...");
+
+        bool completed = false;
+        DirectionsResponse response = null;
+
+        _directions.Query(dr, (DirectionsResponse res) =>
+        {
+            response = res;
+            completed = true;
+        });
+
+        float timeout = 15f;
+        float elapsed = 0f;
+
+        while (!completed && elapsed < timeout)
+        {
+            elapsed += Time.deltaTime;
+            UpdateAPIDebugText($"API Request sent...\nWaiting for response...\nElapsed: {elapsed:F1}s / {timeout}s");
+            yield return null;
+        }
+
+        if (!completed)
+        {
+            UpdateAPIDebugText("API REQUEST TIMEOUT!\nNo response received after 15s\nCheck internet connection");
+            yield break;
+        }
+
+        StringBuilder debugInfo = new StringBuilder();
+        debugInfo.AppendLine("=== RAW API RESPONSE ===");
+
+        if (response != null && response.Routes != null && response.Routes.Count > 0)
+        {
+            var route = response.Routes[0];
+            debugInfo.AppendLine($"SUCCESS!");
+            debugInfo.AppendLine($"Routes count: {response.Routes.Count}");
+            debugInfo.AppendLine($"Geometry points: {route.Geometry?.Count ?? 0}");
+            debugInfo.AppendLine($"Distance: {route.Distance}m");
+            debugInfo.AppendLine($"Duration: {route.Duration}s");
+            debugInfo.AppendLine("");
+
+            if (route.Geometry != null && route.Geometry.Count > 0)
+            {
+                debugInfo.AppendLine($"First 5 geometry points:");
+                for (int i = 0; i < Math.Min(5, route.Geometry.Count); i++)
+                {
+                    var point = route.Geometry[i];
+                    debugInfo.AppendLine($"  [{i}]: {point.x:F6}, {point.y:F6}");
+                }
+                debugInfo.AppendLine("");
+            }
+
+            if (route.Legs != null && route.Legs.Count > 0)
+            {
+                var leg = route.Legs[0];
+                debugInfo.AppendLine($"Steps in first leg: {leg.Steps?.Count ?? 0}");
+                if (leg.Steps != null && leg.Steps.Count > 0)
+                {
+                    debugInfo.AppendLine("First 3 step locations:");
+                    for (int i = 0; i < Math.Min(3, leg.Steps.Count); i++)
+                    {
+                        var step = leg.Steps[i];
+                        if (step.Maneuver != null)
+                        {
+                            debugInfo.AppendLine($"  Step {i}: {step.Maneuver.Location.x:F6}, {step.Maneuver.Location.y:F6}");
+                            debugInfo.AppendLine($"    Instruction: {step.Maneuver.Instruction ?? "No instruction"}");
+                        }
+                    }
+                }
+            }
+
+            // Calculate actual distance between coordinates
+            double straightDistance = CalculateDistanceBetweenPoints(currentPosition, destination);
+            debugInfo.AppendLine("");
+            debugInfo.AppendLine($"ANALYSIS:");
+            debugInfo.AppendLine($"Straight-line distance: {straightDistance:F1}m");
+            debugInfo.AppendLine($"Route distance: {route.Distance:F1}m");
+            debugInfo.AppendLine($"Points per 100m: {(route.Geometry?.Count ?? 0) / (route.Distance / 100f):F1}");
+
+            if ((route.Geometry?.Count ?? 0) < 5)
+            {
+                debugInfo.AppendLine("");
+                debugInfo.AppendLine("WARNING: Very few geometry points!");
+                debugInfo.AppendLine("This explains the arrow visibility issue.");
+            }
+        }
+        else
+        {
+            debugInfo.AppendLine("API CALL FAILED!");
+            debugInfo.AppendLine($"Response null: {response == null}");
+            if (response != null)
+            {
+                debugInfo.AppendLine($"Routes null: {response.Routes == null}");
+                debugInfo.AppendLine($"Routes count: {response.Routes?.Count ?? 0}");
+            }
+            debugInfo.AppendLine("Check:");
+            debugInfo.AppendLine("- Internet connection");
+            debugInfo.AppendLine("- Mapbox API key");
+            debugInfo.AppendLine("- Coordinate validity");
+        }
+
+        UpdateAPIDebugText(debugInfo.ToString());
+    }
+
+    private void UpdateAPIDebugText(string text)
+    {
+        if (apiDebugText != null)
+        {
+            apiDebugText.text = text;
+            if (debugPanel != null && !debugPanel.activeInHierarchy)
+            {
+                debugPanel.SetActive(true);
+            }
+        }
+    }
     private void UpdateUserPosition()
     {
         if (arCamera != null)
@@ -1037,22 +1936,6 @@ public void TestIndoorRouteOptimal()
         {
             var location = Input.location.lastData;
             currentPosition = new Vector2d(location.latitude, location.longitude);
-        }
-    }
-
-    private void UpdateArrowVisibility()
-    {
-        if (!showAllArrows)
-        {
-            foreach (var arrowData in staticArrows)
-            {
-                if (arrowData.arrowObject != null)
-                {
-                    float distance = Vector3.Distance(userARPosition, arrowData.targetARPosition);
-                    bool shouldBeVisible = distance <= maxVisibleDistance;
-                    arrowData.arrowObject.SetActive(shouldBeVisible);
-                }
-            }
         }
     }
     private void ClearExistingArrows()
@@ -1089,24 +1972,66 @@ public void TestIndoorRouteOptimal()
         if (statusText != null)
             statusText.text = status;
     }
-
-    private void UpdateDebugDisplay()
+    // Enhanced debug display that shows current processing state
+private void UpdateDebugDisplayEnhanced()
     {
         if (debugText != null)
         {
-            debugText.text = $"=== AR NAV DEBUG V5.0 FIXED ===\n" +
-                             $"Status: {currentStatus}\n" +
-                             $"GPS: {(locationInitialized ? "Ready" : "Init...")}\n" +
-                             $"Planes: {planesDetected} (Locked: {planeLocked})\n" +
-                             $"Route Points: {rawRoutePoints.Count}\n" +
-                             $"AR Positions: {routeARPositions.Count}\n" +
-                             $"Selected: {selectedRouteIndices.Count}\n" +
-                             $"Active Arrows: {activeArrows.Count}\n" +
-                             $"Spawned: {spawnedArrows.Count}\n" +
-                             $"Mode: {(useTestRoute ? "TEST/INDOOR" : "OUTDOOR/REAL")}\n" +
-                             $"Scale Factor: {indoorScaleFactor}\n" +
-                             $"Spacing: {arrowSpacing}m\n" +
-                             $"GPS: {currentPosition.x:F6}, {currentPosition.y:F6}";
+            StringBuilder debug = new StringBuilder();
+            debug.AppendLine("=== AR NAV DEBUG V6.0 ===");
+            debug.AppendLine($"Status: {currentStatus}");
+            debug.AppendLine($"GPS: {(locationInitialized ? "Ready" : "Init...")}");
+            debug.AppendLine($"Planes: {planesDetected} (Locked: {planeLocked})");
+            debug.AppendLine("");
+
+            // Route data
+            debug.AppendLine("ROUTE DATA:");
+            debug.AppendLine($"Raw Points: {rawRoutePoints?.Count ?? 0}");
+            debug.AppendLine($"AR Positions: {routeARPositions?.Count ?? 0}");
+            debug.AppendLine($"Selected: {selectedRouteIndices?.Count ?? 0}");
+            debug.AppendLine($"Route Received: {routeReceived}");
+            debug.AppendLine($"Route Requested: {routeRequested}");
+            debug.AppendLine("");
+
+            // Arrow data
+            debug.AppendLine("ARROW DATA:");
+            debug.AppendLine($"Active Arrows: {activeArrows?.Count ?? 0}");
+            debug.AppendLine($"Managed Arrows: {managedArrowObjects?.Count ?? 0}");
+            debug.AppendLine($"Spawned: {spawnedArrows?.Count ?? 0}");
+            debug.AppendLine($"Arrows Spawned Flag: {arrowsSpawned}");
+            debug.AppendLine("");
+
+            // Settings
+            debug.AppendLine("SETTINGS:");
+            debug.AppendLine($"Mode: {(useTestRoute ? "TEST/INDOOR" : "OUTDOOR/REAL")}");
+            debug.AppendLine($"Navigation: {currentMode}");
+            debug.AppendLine($"Scale Factor: {indoorScaleFactor}");
+            debug.AppendLine($"Spacing: {arrowSpacing}m");
+            debug.AppendLine($"Max Arrows: {maxArrows}");
+            debug.AppendLine("");
+
+            // GPS coordinates
+            debug.AppendLine("COORDINATES:");
+            debug.AppendLine($"Current: {currentPosition.x:F6}, {currentPosition.y:F6}");
+            debug.AppendLine($"Destination: {destination.x:F6}, {destination.y:F6}");
+
+            // Calculate and show distance
+            double distance = CalculateDistanceBetweenPoints(currentPosition, destination);
+            debug.AppendLine($"Distance: {distance:F1}m");
+
+            debugText.text = debug.ToString();
+        }
+    }
+    private void UpdateDebugDisplay()
+    {
+        UpdateDebugDisplayEnhanced();
+    }
+    [ContextMenu("Show/Hide Debug Panel")]
+    public void ToggleDebugPanel()
+    {
+        if (debugPanel != null)
+        {
+            debugPanel.SetActive(!debugPanel.activeInHierarchy);
         }
     }
 
@@ -1165,7 +2090,7 @@ public void TestIndoorRouteOptimal()
         arrowsSpawned = false;
         rawRoutePoints.Clear();
         routeARPositions.Clear();
-        StartCoroutine(RequestNavigationRoute());
+        StartCoroutine(RequestNavigationRouteWithMode());
     }
 
     [ContextMenu("Force Plane Detection Check")]
@@ -1485,6 +2410,13 @@ public void TestIndoorRouteOptimal()
             LogAR("🔄 Reprocessing route with new origin...");
             StartCoroutine(ProcessRouteData());
         }
+    }
+    public class ArrowMetadata : MonoBehaviour
+    {
+        public int RouteIndex { get; set; }
+        public float DistanceFromStart { get; set; }
+        public Vector3 StableWorldPosition { get; set; }
+        public float LastUpdateTime { get; set; }
     }
 
     #endregion
