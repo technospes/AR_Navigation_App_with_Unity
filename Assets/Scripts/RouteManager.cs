@@ -102,7 +102,6 @@ public class RouteManager : MonoBehaviour
     private Directions _directions;
     private List<GameObject> activeArrows = new List<GameObject>();
     private List<Vector3> routeWorldPositions = new List<Vector3>();
-    private List<Vector3> routeARPositions = new List<Vector3>();
     private List<Vector2d> rawRoutePoints = new List<Vector2d>();
     private List<int> selectedRouteIndices = new List<int>();
 
@@ -111,8 +110,8 @@ public class RouteManager : MonoBehaviour
     private List<ARAnchor> arrowAnchors = new List<ARAnchor>();
 
     // GPS coordinates
-    private Vector2d currentPosition = new Vector2d(29.907952863449825, 78.09645393724858);
-    private Vector2d destination = new Vector2d(29.907222551756956, 78.09838079505975);
+    private Vector2d currentPosition = new Vector2d(28.45752192559391, 77.49698005440952);
+    private Vector2d destination = new Vector2d(28.458518170006098, 77.49897001364432);
     private Mapbox.Utils.Vector2d referencePosition;
 
     private Vector3 arOriginWorldPos = Vector3.zero;
@@ -190,7 +189,7 @@ public class RouteManager : MonoBehaviour
         UpdateUserPosition();
 
         // ENHANCED: More responsive dynamic arrow management
-        if (arrowsSpawned && routeARPositions.Count > 0)
+        if (arrowsSpawned && routeWorldPositions.Count > 0)
         {
             float distanceMoved = Vector3.Distance(userARPosition, lastUserPositionForUpdate);
 
@@ -458,7 +457,7 @@ public class RouteManager : MonoBehaviour
         arrowsSpawned = false;
 
         rawRoutePoints.Clear();
-        routeARPositions.Clear();
+        routeWorldPositions.Clear();
         selectedRouteIndices.Clear();
 
         yield return StartCoroutine(RequestNavigationRouteWithMode());
@@ -544,7 +543,7 @@ public class RouteManager : MonoBehaviour
                 if (pointDensity < 7.0f)
                 {
                     // Force a point to exist at least every 15 meters.
-                    rawRoutePoints = DensifyRoute(rawRoutePoints, 15.0f);
+                    rawRoutePoints = DensifyRoute(rawRoutePoints, arrowSpacing, totalRouteDistance, currentMode);
                 }
                 // --- END OF FINAL FIX ---
             }
@@ -569,6 +568,82 @@ public class RouteManager : MonoBehaviour
         }
 
         LogAR($"Final result: {rawRoutePoints?.Count ?? 0} route points, routeReceived: {routeReceived}");
+    }
+    private float CalculateTotalDistance(List<Vector2d> points)
+    {
+        if (points == null || points.Count < 2)
+            return 0f;
+
+        float totalDistance = 0f;
+        for (int i = 1; i < points.Count; i++)
+        {
+            totalDistance += (float)CalculateDistanceBetweenPoints(points[i - 1], points[i]);
+        }
+        return totalDistance;
+    }
+
+    private void AdaptSettingsToRoute(float routeDistance, int pointCount)
+    {
+        LogAR("Adapting navigation settings to the current route...");
+
+        // 1. Mode-based defaults
+        switch (currentMode)
+        {
+            case NavigationMode.Walking:
+                arrowSpacing = 6f;
+                spawnAheadDistance = 80f;
+                updateDistanceThreshold = 5f;
+                break;
+            case NavigationMode.Cycling:
+                arrowSpacing = 15f;
+                spawnAheadDistance = 120f;
+                updateDistanceThreshold = 10f;
+                break;
+            case NavigationMode.Driving:
+                arrowSpacing = 30f;
+                spawnAheadDistance = 200f;
+                updateDistanceThreshold = 20f;
+                break;
+        }
+
+        // 2. Adjust for route length
+        if (routeDistance < 300) // short route
+        {
+            arrowSpacing *= 0.8f; // denser arrows
+        }
+        else if (routeDistance > 5000) // long route 5km+
+        {
+            arrowSpacing *= 1.5f; // fewer arrows
+            spawnAheadDistance *= 1.5f;
+        }
+
+        // 3. Cap for very long routes (e.g., 100km+)
+        if (routeDistance > 50000)
+        {
+            arrowSpacing = Mathf.Clamp(routeDistance / 500f, 30f, 500f);
+            spawnAheadDistance = Mathf.Clamp(routeDistance / 50f, 200f, 1000f);
+        }
+
+        // 4. Auto set other settings
+        initialSpawnDistance = spawnAheadDistance;
+        continuousSpawnAhead = spawnAheadDistance * 0.5f;
+        arrowDespawnBehind = spawnAheadDistance * 0.2f;
+        despawnBehindDistance = arrowDespawnBehind;
+        arrowStabilityRadius = Mathf.Clamp(updateDistanceThreshold * 0.6f, 2f, 5f);
+        maxVisibleDistance = spawnAheadDistance * 1.5f;
+
+        maxArrows = Mathf.Clamp(Mathf.RoundToInt(routeDistance / arrowSpacing), 10, 300);
+        minimumVisibleArrows = Mathf.Clamp(Mathf.RoundToInt(maxArrows * 0.2f), 5, 20);
+
+        // 5. Sparse route fallback: force arrow per point
+        if (pointCount <= 20)
+        {
+            LogAR("Sparse route detected - forcing arrow at each point");
+            arrowSpacing = Mathf.Max(5f, arrowSpacing * 0.5f);
+            minimumVisibleArrows = pointCount;
+        }
+
+        LogAR($"Settings adapted: Spacing={arrowSpacing:F1}m, Lookahead={spawnAheadDistance:F1}m, MaxArrows={maxArrows}, MinVisible={minimumVisibleArrows}");
     }
 
 
@@ -644,70 +719,6 @@ public class RouteManager : MonoBehaviour
 
         LogAR("Emergency respawn complete");
     }
-    private List<int> SelectRoutePointsAdvanced(List<Vector3> arPositions, float minSpacing)
-    {
-        List<int> selectedIndices = new List<int>();
-
-        if (arPositions.Count == 0) return selectedIndices;
-        if (arPositions.Count == 1)
-        {
-            selectedIndices.Add(0);
-            return selectedIndices;
-        }
-
-        LogAR("=== ADVANCED ROUTE SELECTION ===");
-        LogAR($"Input: {arPositions.Count} positions, min spacing: {minSpacing:F2}m");
-
-        // Calculate cumulative distances
-        List<float> cumDist = new List<float> { 0f };
-        for (int i = 1; i < arPositions.Count; i++)
-        {
-            float d = Vector3.Distance(arPositions[i], arPositions[i - 1]);
-            cumDist.Add(cumDist[i - 1] + d);
-        }
-        float totalDist = cumDist[cumDist.Count - 1];
-
-        // Adaptive arrow count based on route characteristics
-        int baseArrowCount = Mathf.FloorToInt(totalDist / minSpacing) + 1;
-        int adaptiveArrowCount = CalculateAdaptiveArrowCount(totalDist, baseArrowCount);
-        adaptiveArrowCount = Mathf.Clamp(adaptiveArrowCount, minimumVisibleArrows, maxArrows);
-
-        LogAR($"Arrow calculation: base={baseArrowCount}, adaptive={adaptiveArrowCount}, final={adaptiveArrowCount}");
-
-        // Always include start
-        selectedIndices.Add(0);
-
-        if (adaptiveArrowCount > 2)
-        {
-            float idealSpacing = totalDist / (adaptiveArrowCount - 1f);
-
-            // Select intermediate points
-            for (int k = 1; k < adaptiveArrowCount - 1; k++)
-            {
-                float targetDist = k * idealSpacing;
-                int bestIndex = FindBestIndexForDistance(cumDist, targetDist, selectedIndices);
-
-                if (bestIndex != -1 && !selectedIndices.Contains(bestIndex))
-                {
-                    selectedIndices.Add(bestIndex);
-                    LogAR($"Selected arrow at index {bestIndex}, distance {cumDist[bestIndex]:F1}m");
-                }
-            }
-        }
-
-        // Always include end
-        int endIndex = arPositions.Count - 1;
-        if (!selectedIndices.Contains(endIndex))
-        {
-            selectedIndices.Add(endIndex);
-        }
-
-        // Sort indices to maintain order
-        selectedIndices.Sort();
-
-        LogAR($"Route selection complete: {selectedIndices.Count} points selected");
-        return selectedIndices;
-    }
 
     // Add this NEW helper method to your script
     private double CalculateDistanceBetweenPoints(Vector2d point1, Vector2d point2)
@@ -736,45 +747,54 @@ public class RouteManager : MonoBehaviour
             yield break;
         }
 
-        routeOrigin = rawRoutePoints[0];
-        routeARPositions.Clear();
+        // Align route with AR world origin if plane is locked
+        if (planeLocked && referencePosition != null)
+        {
+            LogAR("Using referencePosition as conversion origin to align route with AR world.");
+            routeOrigin = referencePosition;
+        }
+        else
+        {
+            routeOrigin = rawRoutePoints[0];
+        }
+
+        routeWorldPositions.Clear();
         selectedRouteIndices.Clear();
         ClearExistingArrows();
 
-        // Convert GPS to AR coordinates
+        // Convert GPS → AR world positions
         for (int i = 0; i < rawRoutePoints.Count; i++)
         {
             Vector2d gpsPoint = rawRoutePoints[i];
-            Vector3 arPosition = ConvertGPSToAR(gpsPoint);
-            routeARPositions.Add(arPosition);
-
-            if (i % 3 == 2) yield return null; // Prevent frame drops
+            Vector3 worldPos = GPSToWorld(gpsPoint);
+            routeWorldPositions.Add(worldPos);
         }
 
-        // Center route for indoor testing
-        if (useTestRoute && routeARPositions.Count > 0)
+        // Optional: center route for indoor testing
+        if (useTestRoute && routeWorldPositions.Count > 0)
         {
             CenterRouteForIndoorTesting();
         }
 
-        // Calculate distances and optimal spacing
-        CalculateOptimalArrowSpacing();
+        // ⚡ Don't overwrite arrowSpacing here! Just log average distances
+        LogAverageSegmentDistance();
 
-        // Use improved selection algorithm
-        selectedRouteIndices = SelectRoutePointsImproved(routeARPositions, arrowSpacing);
+        // Select arrow indices based on final arrowSpacing
+        selectedRouteIndices = SelectRoutePointsImproved(routeWorldPositions, arrowSpacing);
 
         LogAR($"Route processed: {selectedRouteIndices.Count} arrow positions selected");
         UpdateStatus($"Route ready: {selectedRouteIndices.Count} arrows planned");
 
-        // Initialize dynamic arrow system
+        // Initialize arrow system
         arrowsSpawned = true;
         lastUserPositionForUpdate = userARPosition;
 
-        // Spawn initial arrows
+        // Spawn arrows at selected indices
         SpawnInitialGuidanceArrows();
 
         LogAR("=== ROUTE PROCESSING COMPLETED ===");
     }
+
     private int CalculateAdaptiveArrowCount(float totalDistance, int baseCount)
     {
         // Adjust based on navigation mode
@@ -826,15 +846,15 @@ public class RouteManager : MonoBehaviour
     }
     private void CenterRouteForIndoorTesting()
     {
-        if (routeARPositions.Count == 0) return;
+        if (routeWorldPositions.Count == 0) return;
 
         // Calculate centroid
         Vector3 centroid = Vector3.zero;
-        foreach (var pos in routeARPositions)
+        foreach (var pos in routeWorldPositions)
         {
             centroid += pos;
         }
-        centroid /= routeARPositions.Count;
+        centroid /= routeWorldPositions.Count;
         centroid.y = 0f;
 
         // Position route in front of camera
@@ -843,11 +863,11 @@ public class RouteManager : MonoBehaviour
         Quaternion cameraYawRot = Quaternion.Euler(0f, arCamera.transform.eulerAngles.y, 0f);
 
         // Reposition and rotate every point
-        for (int i = 0; i < routeARPositions.Count; i++)
+        for (int i = 0; i < routeWorldPositions.Count; i++)
         {
-            routeARPositions[i] -= centroid;
-            routeARPositions[i] = cameraYawRot * routeARPositions[i];
-            routeARPositions[i] += cameraForwardOffset;
+            routeWorldPositions[i] -= centroid;
+            routeWorldPositions[i] = cameraYawRot * routeWorldPositions[i];
+            routeWorldPositions[i] += cameraForwardOffset;
         }
 
         LogAR("Route centered and rotated for indoor testing");
@@ -862,57 +882,62 @@ public class RouteManager : MonoBehaviour
             yield break;
         }
 
-        // For outdoor real routes, don't limit the points unless absolutely necessary
+        // Handle long route info (optional logging)
         if (!useTestRoute && rawRoutePoints.Count > maxPointsPerSegment)
         {
             LogAR($"Long route detected: {rawRoutePoints.Count} points, processing first {maxPointsPerSegment}");
-            // Keep the full route but process in segments for performance
-            // For now, process all points but we could optimize this later
         }
 
-        // Process the full route data
+        // 1. Calculate total route distance first
+        totalRouteDistance = CalculateTotalDistance(rawRoutePoints);
+
+        // 2. Adapt navigation settings dynamically for this route
+        AdaptSettingsToRoute(totalRouteDistance, rawRoutePoints.Count);
+
+        // 3. Densify route points if large gaps exist
+        rawRoutePoints = DensifyRoute(rawRoutePoints, arrowSpacing, totalRouteDistance, currentMode);
+
+        // 4. Process the full route data (AR conversion + arrow planning)
         yield return StartCoroutine(ProcessRouteData());
 
-        // Calculate distances for dynamic spawning
+        // 5. Calculate distances for dynamic arrow updates
         CalculateCumulativeDistances();
 
-        LogAR($"Initial segment processed: {routeARPositions.Count} AR positions, {totalRouteDistance:F1}m total");
+        LogAR($"Initial segment processed: {routeWorldPositions.Count} AR positions, {totalRouteDistance:F1}m total");
     }
 
+
     // FIXED: GPS to AR conversion
-    private Vector3 ConvertGPSToAR(Vector2d gpsPoint)
+    // DELETE your old ConvertGPSToAR method and ADD this one.
+    private Vector3 GPSToWorld(Vector2d gpsPoint)
     {
+        // Use the same origin used for conversion (routeOrigin)
         double latDiff = gpsPoint.x - routeOrigin.x;
         double lonDiff = gpsPoint.y - routeOrigin.y;
 
         double metersPerDegreeLat = 111320.0;
-        double metersPerDegreeLon = 111320.0 * System.Math.Cos(routeOrigin.x * System.Math.PI / 180.0);
+        double metersPerDegreeLon = 111320.0 * Math.Cos(routeOrigin.x * Math.PI / 180.0);
 
         double xMeters = lonDiff * metersPerDegreeLon;
         double zMeters = latDiff * metersPerDegreeLat;
 
-        // FIXED: Apply indoor scaling correctly
+        // Apply indoor scaling correctly if in test mode
         if (useTestRoute)
         {
-            // For indoor testing, we want the route to appear at a reasonable size
-            // The indoor scale factor makes coordinates visible in AR
             xMeters *= indoorScaleFactor;
             zMeters *= indoorScaleFactor;
-
-            LogAR($"   Indoor scaled: X={xMeters:F6}m, Z={zMeters:F6}m (scale factor: {indoorScaleFactor})");
         }
 
-        float x = (float)xMeters;
-        float z = (float)zMeters;
-        float y = 0f;
+        Vector3 localOffset = new Vector3((float)xMeters, 0f, (float)zMeters);
 
-        Vector3 result = new Vector3(x, y, z);
-        result = northAlignment * result;
-        LogAR($"   AR Pos after alignment: ({result.x:F3}, {result.z:F3}), North heading: {Input.compass.trueHeading:F1}");
-        return result;
+        // Apply northAlignment to orient the offset correctly
+        localOffset = northAlignment * localOffset;
+
+        // Add the offset to the AR World Origin to get the final world position
+        return arOriginWorldPos + localOffset;
     }
     // 4. ADDITIONAL: Add this method to test with better settings
-[ContextMenu("Test Indoor Route with Optimal Settings")]
+    [ContextMenu("Test Indoor Route with Optimal Settings")]
 public void TestIndoorRouteOptimal()
 {
     LogAR("🧪 TESTING WITH OPTIMAL INDOOR SETTINGS...");
@@ -929,7 +954,7 @@ public void TestIndoorRouteOptimal()
     // Clear and regenerate
     ClearExistingArrows();
     rawRoutePoints.Clear();
-    routeARPositions.Clear();
+    routeWorldPositions.Clear();
     selectedRouteIndices.Clear();
     routeRequested = false;
     routeReceived = false;
@@ -1028,7 +1053,7 @@ public void TestIndoorRouteOptimal()
     }
     private void UpdateDynamicArrowSpawning()
     {
-        if (routeARPositions == null || routeARPositions.Count < 2 || primaryPlane == null)
+        if (routeWorldPositions == null || routeWorldPositions.Count < 2 || primaryPlane == null)
         {
             return;
         }
@@ -1068,42 +1093,6 @@ public void TestIndoorRouteOptimal()
 
         LogAR($"Dynamic update complete: {managedArrowObjects.Count} total arrows");
     }
-    private void RemoveArrow(GameObject arrow)
-    {
-        if (arrow == null) return;
-
-        // Get metadata for logging
-        ArrowMetadata metadata = arrow.GetComponent<ArrowMetadata>();
-        int routeIndex = metadata != null ? metadata.RouteIndex : -1;
-
-        LogAR($"Removing arrow {routeIndex}");
-
-        // Remove from all tracking lists
-        managedArrowObjects.Remove(arrow);
-        activeArrows.Remove(arrow);
-        spawnedArrows.Remove(arrow);
-
-        // Find and remove the corresponding anchor
-        Transform anchorTransform = arrow.transform.parent;
-        if (anchorTransform != null)
-        {
-            ARAnchor anchor = anchorTransform.GetComponent<ARAnchor>();
-            if (anchor != null)
-            {
-                arrowAnchors.Remove(anchor);
-                LogAR($"Destroying anchor for arrow {routeIndex}");
-            }
-
-            // Destroy the entire anchor object (which includes the arrow)
-            Destroy(anchorTransform.gameObject);
-        }
-        else
-        {
-            // If somehow the arrow has no parent anchor, destroy it directly
-            LogAR($"Warning: Arrow {routeIndex} has no parent anchor, destroying directly");
-            Destroy(arrow);
-        }
-    }
     private HashSet<int> CalculateRequiredArrowIndices(float spawnStart, float spawnEnd)
     {
         HashSet<int> requiredIndices = new HashSet<int>();
@@ -1119,7 +1108,7 @@ public void TestIndoorRouteOptimal()
         // Add intermediate points based on spacing
         float lastIncludedDistance = spawnStart - arrowSpacing;
 
-        for (int i = 1; i < routeARPositions.Count - 1; i++)
+        for (int i = 1; i < routeWorldPositions.Count - 1; i++)
         {
             float routeDistance = cumulativeDistances[i];
 
@@ -1145,7 +1134,7 @@ public void TestIndoorRouteOptimal()
             float reducedSpacing = arrowSpacing * 0.7f;
             lastIncludedDistance = spawnStart - reducedSpacing;
 
-            for (int i = 0; i < routeARPositions.Count && requiredIndices.Count < minimumVisibleArrows; i++)
+            for (int i = 0; i < routeWorldPositions.Count && requiredIndices.Count < minimumVisibleArrows; i++)
             {
                 float routeDistance = cumulativeDistances[i];
 
@@ -1196,7 +1185,7 @@ public void TestIndoorRouteOptimal()
         LogAR("=== DIAGNOSING SPAWN ISSUES ===");
         LogAR($"Primary plane: {primaryPlane != null}");
         LogAR($"Arrow prefab: {arrowPrefab != null}");
-        LogAR($"Route positions: {routeARPositions?.Count ?? 0}");
+        LogAR($"Route positions: {routeWorldPositions?.Count ?? 0}");
         LogAR($"Selected indices: {selectedRouteIndices?.Count ?? 0}");
         LogAR($"Managed arrows: {managedArrowObjects?.Count ?? 0}");
 
@@ -1362,7 +1351,7 @@ public void TestIndoorRouteOptimal()
             LogAR("=== ROUTE REQUEST WITH NAVIGATION MODE ===");
             ClearExistingArrows();
             rawRoutePoints.Clear();
-            routeARPositions.Clear();
+            routeWorldPositions.Clear();
             routeReceived = false;
             arrowsSpawned = false;
             routeRequested = true;
@@ -1422,69 +1411,42 @@ public void TestIndoorRouteOptimal()
         public Vector3 direction;
         public bool shouldExist;
     }
-
-    //private UserProgressData CalculateUserProgress()
-    //{
-    //    UserProgressData progress = new UserProgressData();
-    //    float closestDistance = float.MaxValue;
-
-    //    Vector3 userPosFlat = new Vector3(userARPosition.x, 0, userARPosition.z);
-
-    //    for (int i = 0; i < routeARPositions.Count - 1; i++)
-    //    {
-    //        Vector3 segmentStart = new Vector3(routeARPositions[i].x, 0, routeARPositions[i].z);
-    //        Vector3 segmentEnd = new Vector3(routeARPositions[i + 1].x, 0, routeARPositions[i + 1].z);
-
-    //        Vector3 closestPoint = FindNearestPointOnLine(segmentStart, segmentEnd, userPosFlat);
-    //        float distance = Vector3.Distance(userPosFlat, closestPoint);
-
-    //        if (distance < closestDistance)
-    //        {
-    //            closestDistance = distance;
-    //            progress.nearestRouteIndex = i;
-    //            progress.projectedPosition = closestPoint;
-    //            progress.distanceFromRoute = distance;
-
-    //            // Calculate distance along route
-    //            progress.distanceAlongRoute = cumulativeDistances[i] +
-    //                Vector3.Distance(segmentStart, closestPoint);
-    //        }
-    //    }
-
-    //    return progress;
-    //}
-
     // Add this new helper method to your script
-    private List<Vector2d> DensifyRoute(List<Vector2d> sparsePoints, float desiredSpacing)
+    private List<Vector2d> DensifyRoute(List<Vector2d> sparsePoints, float baseSpacing, float routeDistance,NavigationMode mode)
     {
         if (sparsePoints == null || sparsePoints.Count < 2)
-        {
-            return sparsePoints; // Not enough points to densify
-        }
+            return sparsePoints;
 
-        LogAR($"Densifying route: Starting with {sparsePoints.Count} points, target spacing {desiredSpacing}m");
+        // 1. Adjust spacing dynamically based on mode and route distance
+        float desiredSpacing = baseSpacing;
+        if (mode == NavigationMode.Walking) desiredSpacing = Mathf.Clamp(baseSpacing, 4f, 10f);
+        else if (mode == NavigationMode.Cycling) desiredSpacing = Mathf.Clamp(baseSpacing * 2f, 10f, 25f);
+        else if (mode == NavigationMode.Driving) desiredSpacing = Mathf.Clamp(baseSpacing * 4f, 20f, 50f);
+
+        // Very long route? Increase spacing to reduce point count
+        if (routeDistance > 5000) desiredSpacing *= 1.5f;
+        if (routeDistance > 50000) desiredSpacing *= 2.5f;
+
+        LogAR($"Densifying route: {sparsePoints.Count} → Target spacing: {desiredSpacing}m | Route length: {routeDistance:F1}m | Mode: {mode}");
 
         List<Vector2d> densePoints = new List<Vector2d>();
-        densePoints.Add(sparsePoints[0]); // Always add the very first point
+        densePoints.Add(sparsePoints[0]);
 
-        // Go through each line segment of the sparse route
+        int maxPointsPerSegment = 50; // Cap per segment to prevent explosion
+
         for (int i = 0; i < sparsePoints.Count - 1; i++)
         {
             Vector2d p1 = sparsePoints[i];
             Vector2d p2 = sparsePoints[i + 1];
-
             double segmentDistance = CalculateDistanceBetweenPoints(p1, p2);
 
-            // If the segment is longer than our desired spacing, we need to add points
             if (segmentDistance > desiredSpacing)
             {
-                int pointsToInsert = Mathf.FloorToInt((float)segmentDistance / desiredSpacing);
+                int pointsToInsert = Mathf.Min(Mathf.FloorToInt((float)segmentDistance / desiredSpacing), maxPointsPerSegment);
 
                 for (int j = 1; j <= pointsToInsert; j++)
                 {
-                    double t = (double)j / (pointsToInsert + 1); // Get interpolation factor (e.g., 0.33, 0.66)
-
-                    // Linearly interpolate to create a new point
+                    double t = (double)j / (pointsToInsert + 1);
                     Vector2d interpolatedPoint = new Vector2d(
                         p1.x + (p2.x - p1.x) * t,
                         p1.y + (p2.y - p1.y) * t
@@ -1492,10 +1454,11 @@ public void TestIndoorRouteOptimal()
                     densePoints.Add(interpolatedPoint);
                 }
             }
-            densePoints.Add(p2); // Always add the end point of the segment
+
+            densePoints.Add(p2);
         }
 
-        LogAR($"Densification complete: Route now has {densePoints.Count} points.");
+        LogAR($"Densification complete: {densePoints.Count} points after processing");
         return densePoints;
     }
     private UserProgressData CalculateUserProgressEnhanced()
@@ -1507,10 +1470,10 @@ public void TestIndoorRouteOptimal()
         Vector3 userPosFlat = new Vector3(userARPosition.x, 0, userARPosition.z);
 
         // Check each route segment
-        for (int i = 0; i < routeARPositions.Count - 1; i++)
+        for (int i = 0; i < routeWorldPositions.Count - 1; i++)
         {
-            Vector3 segmentStart = new Vector3(routeARPositions[i].x, 0, routeARPositions[i].z);
-            Vector3 segmentEnd = new Vector3(routeARPositions[i + 1].x, 0, routeARPositions[i + 1].z);
+            Vector3 segmentStart = new Vector3(routeWorldPositions[i].x, 0, routeWorldPositions[i].z);
+            Vector3 segmentEnd = new Vector3(routeWorldPositions[i + 1].x, 0, routeWorldPositions[i + 1].z);
 
             Vector3 closestPoint = FindNearestPointOnLine(segmentStart, segmentEnd, userPosFlat);
             float distance = Vector3.Distance(userPosFlat, closestPoint);
@@ -1566,77 +1529,7 @@ public void TestIndoorRouteOptimal()
             LogAR($"Removed orphaned arrow {routeIndex}");
         }
     }
-    private Vector3 CalculateStableWorldPosition(Vector3 arPosition)
-    {
-        // Convert AR position to stable world position
-        Vector3 worldPos = primaryPlane.transform.TransformPoint(arPosition);
 
-        // Project onto detected ground plane using raycast
-        Vector3 screenPoint = arCamera.WorldToScreenPoint(worldPos);
-        List<ARRaycastHit> hits = new List<ARRaycastHit>();
-
-        if (raycastManager.Raycast(screenPoint, hits, TrackableType.Planes))
-        {
-            worldPos = hits[0].pose.position;
-            worldPos.y += arrowHeightOffset;
-        }
-        else
-        {
-            // Fallback to plane height
-            worldPos.y = primaryPlane.transform.position.y + arrowHeightOffset;
-        }
-
-        return worldPos;
-    }
-    private Vector3 CalculateArrowDirectionEnhanced(int routeIndex)
-    {
-        Vector3 direction = Vector3.forward; // Better fallback than camera forward
-
-        if (routeIndex < routeARPositions.Count - 1)
-        {
-            Vector3 current = routeARPositions[routeIndex];
-            Vector3 next = routeARPositions[routeIndex + 1];
-
-            direction = (next - current).normalized;
-            direction.y = 0f; // Keep horizontal
-
-            // If points are too close, look ahead further
-            if (direction.magnitude < 0.1f)
-            {
-                for (int lookAhead = 2; lookAhead <= 5 && routeIndex + lookAhead < routeARPositions.Count; lookAhead++)
-                {
-                    Vector3 futurePoint = routeARPositions[routeIndex + lookAhead];
-                    direction = (futurePoint - current).normalized;
-                    direction.y = 0f;
-
-                    if (direction.magnitude > 0.1f)
-                    {
-                        LogAR($"Arrow {routeIndex} using lookahead {lookAhead} for direction");
-                        break;
-                    }
-                }
-            }
-
-            // If still no good direction, use route tangent
-            if (direction.magnitude < 0.1f && routeIndex > 0)
-            {
-                Vector3 previous = routeARPositions[routeIndex - 1];
-                direction = (current - previous).normalized;
-                direction.y = 0f;
-                LogAR($"Arrow {routeIndex} using backward direction");
-            }
-        }
-        else if (routeIndex > 0)
-        {
-            // Last arrow: use direction from previous point
-            Vector3 current = routeARPositions[routeIndex];
-            Vector3 previous = routeARPositions[routeIndex - 1];
-            direction = (current - previous).normalized;
-            direction.y = 0f;
-        }
-
-        return direction;
-    }
     [ContextMenu("Test Enhanced Dynamic Spawning")]
     public void TestEnhancedDynamicSpawning()
     {
@@ -1648,7 +1541,7 @@ public void TestIndoorRouteOptimal()
             return;
         }
 
-        if (routeARPositions.Count == 0)
+        if (routeWorldPositions.Count == 0)
         {
             LogErrorAR("No route data - generate route first");
             return;
@@ -1662,30 +1555,12 @@ public void TestIndoorRouteOptimal()
 
         LogAR("Enhanced spawning test initiated");
     }
-    private bool CanSpawnArrowAtIndex(int routeIndex)
-    {
-        // Prevent rapid respawning of the same arrow
-        if (arrowSpawnCooldowns.ContainsKey(routeIndex))
-        {
-            float timeSinceLastSpawn = Time.time - arrowSpawnCooldowns[routeIndex];
-            if (timeSinceLastSpawn < 2f) // 2 second cooldown
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
-    private void SetArrowSpawnCooldown(int routeIndex)
-    {
-        arrowSpawnCooldowns[routeIndex] = Time.time;
-    }
     [ContextMenu("Force Show All Route Arrows")]
     public void ForceShowAllRouteArrows()
     {
         LogAR("=== FORCE SHOWING ALL ROUTE ARROWS ===");
 
-        if (routeARPositions.Count == 0)
+        if (routeWorldPositions.Count == 0)
         {
             LogErrorAR("No route data available");
             return;
@@ -1695,7 +1570,7 @@ public void TestIndoorRouteOptimal()
 
         // Create indices for ALL route points (for debugging)
         List<int> allIndices = new List<int>();
-        for (int i = 0; i < routeARPositions.Count; i++)
+        for (int i = 0; i < routeWorldPositions.Count; i++)
         {
             allIndices.Add(i);
         }
@@ -1713,10 +1588,10 @@ public void TestIndoorRouteOptimal()
     {
         Vector3 direction = arCamera.transform.forward; // Fallback
 
-        if (routeIndex < routeARPositions.Count - 1)
+        if (routeIndex < routeWorldPositions.Count - 1)
         {
-            Vector3 current = routeARPositions[routeIndex];
-            Vector3 next = routeARPositions[routeIndex + 1];
+            Vector3 current = routeWorldPositions[routeIndex];
+            Vector3 next = routeWorldPositions[routeIndex + 1];
 
             direction = (next - current).normalized;
             direction.y = 0f; // Keep horizontal
@@ -1724,9 +1599,9 @@ public void TestIndoorRouteOptimal()
             if (direction.magnitude < 0.1f)
             {
                 // Look ahead further if points are too close
-                for (int i = routeIndex + 2; i < Mathf.Min(routeIndex + 5, routeARPositions.Count); i++)
+                for (int i = routeIndex + 2; i < Mathf.Min(routeIndex + 5, routeWorldPositions.Count); i++)
                 {
-                    Vector3 futurePoint = routeARPositions[i];
+                    Vector3 futurePoint = routeWorldPositions[i];
                     direction = (futurePoint - current).normalized;
                     direction.y = 0f;
 
@@ -1840,40 +1715,27 @@ public void TestIndoorRouteOptimal()
             default: return 1.0;
         }
     }
-    private void CalculateOptimalArrowSpacing()
+    private void LogAverageSegmentDistance()
     {
-        if (totalRouteDistance <= 0) return;
+        if (routeWorldPositions == null || routeWorldPositions.Count < 2) return;
 
-        // Adjust spacing based on route length and navigation mode
-        float baseSpacing = arrowSpacing;
+        float totalDist = 0f;
+        int segmentCount = 0;
 
-        if (totalRouteDistance < 100f)
+        for (int i = 1; i < routeWorldPositions.Count; i++)
         {
-            // Short routes need closer arrows
-            arrowSpacing = Mathf.Max(baseSpacing * 0.5f, 2f);
-        }
-        else if (totalRouteDistance > 1000f)
-        {
-            // Long routes can have wider spacing
-            arrowSpacing = baseSpacing * 1.5f;
+            float segmentDist = Vector3.Distance(routeWorldPositions[i], routeWorldPositions[i - 1]);
+            totalDist += segmentDist;
+            segmentCount++;
         }
 
-        // Mode-specific adjustments
-        switch (currentMode)
+        if (segmentCount > 0)
         {
-            case NavigationMode.Walking:
-                arrowSpacing *= 0.8f; // Closer for walking
-                break;
-            case NavigationMode.Cycling:
-                arrowSpacing *= 1.0f; // Normal spacing
-                break;
-            case NavigationMode.Driving:
-                arrowSpacing *= 1.3f; // Wider for driving
-                break;
+            float avgDist = totalDist / segmentCount;
+            LogAR($"Average segment distance after densification: {avgDist:F1}m");
         }
-
-        LogAR($"Optimal arrow spacing calculated: {arrowSpacing:F1}m for {currentMode} mode");
     }
+
     public static Vector3 FindNearestPointOnLine(Vector3 origin, Vector3 end, Vector3 point)
     {
         Vector3 heading = end - origin;
@@ -1890,7 +1752,7 @@ public void TestIndoorRouteOptimal()
     {
         LogAR("=== ENHANCED INITIAL ARROW SPAWNING ===");
 
-        if (routeARPositions.Count == 0)
+        if (routeWorldPositions.Count == 0)
         {
             LogErrorAR("No route positions available for arrow spawning");
             return;
@@ -1926,126 +1788,97 @@ public void TestIndoorRouteOptimal()
     private IEnumerator SpawnArrowsFromIndices(List<int> indices)
     {
         LogAR($"=== SPAWNING ARROWS FROM {indices.Count} INDICES ===");
-
-        if (primaryPlane == null)
+        if (primaryPlane == null || arrowPrefab == null)
         {
-            LogErrorAR("Primary plane is null - cannot spawn arrows");
+            LogErrorAR("Missing components (Plane or Prefab) - cannot spawn arrows");
             yield break;
         }
 
-        if (arrowPrefab == null)
-        {
-            LogErrorAR("Arrow prefab is null - check inspector assignment");
-            yield break;
-        }
-
-        int successfulSpawns = 0;
         List<GameObject> newlySpawnedArrows = new List<GameObject>();
 
-        for (int i = 0; i < indices.Count; i++)
-        {
-            int routeIndex = indices[i];
+        // Track last spawned position to prevent overlap
+        Vector3? lastSpawnedPos = null;
 
-            if (routeIndex >= routeARPositions.Count)
+        foreach (int routeIndex in indices)
+        {
+            if (routeIndex >= routeWorldPositions.Count)
             {
                 LogErrorAR($"Invalid route index: {routeIndex}");
                 continue;
             }
 
-            // Check if arrow already exists at this index
-            bool alreadyExists = false;
-            foreach (var existingArrow in managedArrowObjects)
+            // Prevent duplicates
+            if (managedArrowObjects.Any(a => a != null && a.GetComponent<ArrowMetadata>()?.RouteIndex == routeIndex))
             {
-                if (existingArrow != null)
-                {
-                    ArrowMetadata existingMetadata = existingArrow.GetComponent<ArrowMetadata>();
-                    if (existingMetadata != null && existingMetadata.RouteIndex == routeIndex)
-                    {
-                        alreadyExists = true;
-                        LogAR($"Arrow {routeIndex} already exists, skipping");
-                        break;
-                    }
-                }
+                LogAR($"Arrow {routeIndex} already exists, skipping.");
+                continue;
             }
-
-            if (alreadyExists) continue;
-
-            Vector3 arPosition = routeARPositions[routeIndex];
-
-            // IMPROVED: Multi-method position calculation
-            Vector3 worldPosition = CalculateOptimalArrowPosition(arPosition, routeIndex);
-
-            GameObject anchorObject = null;
-            ARAnchor anchor = null;
-            GameObject arrow = null;
-            bool spawnSuccess = false;
 
             try
             {
-                // Create anchor object with better naming
-                anchorObject = new GameObject($"NavArrowAnchor_{routeIndex}_{Time.time:F0}");
-                anchorObject.transform.position = worldPosition;
-                anchorObject.transform.rotation = Quaternion.identity;
+                // Step 1: Get the final, correct world position for the arrow
+                Vector3 worldPosition = CalculateOptimalArrowPosition(routeIndex);
 
-                anchor = anchorObject.AddComponent<ARAnchor>();
-                if (anchor == null)
+                // --- Overlap Fix ---
+                if (lastSpawnedPos.HasValue &&
+                    Vector3.Distance(lastSpawnedPos.Value, worldPosition) < arrowSpacing * 0.8f)
                 {
-                    LogErrorAR($"Failed to create anchor for arrow {routeIndex}");
-                    if (anchorObject != null) Destroy(anchorObject);
+                    LogAR($"Skipping arrow {routeIndex} due to overlap (< {arrowSpacing * 0.8f}m).");
                     continue;
                 }
 
-                // Create arrow as child of anchor
-                arrow = Instantiate(arrowPrefab, anchor.transform);
-                if (arrow != null)
+                // Step 2: Calculate forward direction for arrow orientation
+                Quaternion arrowRotation = Quaternion.identity;
+                if (routeIndex < routeWorldPositions.Count - 1)
                 {
-                    // ENHANCED: Setup arrow with comprehensive metadata
-                    SetupArrowAppearance(arrow, routeIndex);
-                    SetupArrowRotation(arrow, routeIndex);
-                    SetupArrowMetadata(arrow, routeIndex, worldPosition, arPosition);
-
-                    // Track the arrow in all necessary lists
-                    managedArrowObjects.Add(arrow);
-                    arrowAnchors.Add(anchor);
-                    activeArrows.Add(arrow);
-                    spawnedArrows.Add(arrow);
-                    newlySpawnedArrows.Add(arrow);
-
-                    successfulSpawns++;
-                    spawnSuccess = true;
-
-                    LogAR($"✅ Arrow {routeIndex} spawned at world pos: {worldPosition}, AR pos: {arPosition}");
+                    Vector3 dir = routeWorldPositions[routeIndex + 1] - routeWorldPositions[routeIndex];
+                    if (dir.sqrMagnitude > 0.01f)
+                    {
+                        arrowRotation = Quaternion.LookRotation(dir.normalized, Vector3.up);
+                    }
                 }
+
+                // Step 3: Create a stable ARAnchor with both position + rotation
+                ARAnchor anchor = anchorManager.AddAnchor(new Pose(worldPosition, arrowRotation));
+
+                if (anchor == null)
+                {
+                    LogErrorAR($"Failed to create anchor for arrow {routeIndex} using AnchorManager.");
+                    continue;
+                }
+
+                // Step 4: Instantiate arrow prefab as child of anchor
+                GameObject arrow = Instantiate(arrowPrefab, anchor.transform);
+
+                SetupArrowAppearance(arrow, routeIndex);
+                SetupArrowMetadata(arrow, routeIndex, worldPosition, routeWorldPositions[routeIndex]);
+
+                managedArrowObjects.Add(arrow);
+                arrowAnchors.Add(anchor);
+                newlySpawnedArrows.Add(arrow);
+
+                // Update last spawned position
+                lastSpawnedPos = worldPosition;
             }
             catch (System.Exception ex)
             {
                 LogErrorAR($"Exception spawning arrow {routeIndex}: {ex.Message}");
-                spawnSuccess = false;
             }
 
-            if (!spawnSuccess)
-            {
-                LogErrorAR($"Failed to spawn arrow {routeIndex}");
-                if (arrow != null) Destroy(arrow);
-                if (anchorObject != null) Destroy(anchorObject);
-            }
-
-            // Prevent frame drops with yield
-            yield return new WaitForSeconds(0.02f);
+            yield return new WaitForSeconds(0.02f); // Throttle spawnings
         }
 
-        // STEP 3: Post-spawn validation
-        yield return new WaitForSeconds(0.1f); // Allow time for anchors to stabilize
+        yield return new WaitForSeconds(0.1f);
         ValidateSpawnedArrows(newlySpawnedArrows);
-        LogAR($"✅ Arrow spawning complete: {successfulSpawns}/{indices.Count} arrows spawned");
-        LogAR($"📊 Total managed arrows: {managedArrowObjects.Count}");
-        UpdateStatus($"Navigation ready: {successfulSpawns} arrows visible");
+        LogAR($"✅ Arrow spawning complete: {newlySpawnedArrows.Count}/{indices.Count} new arrows spawned.");
+        UpdateStatus($"Navigation ready: {managedArrowObjects.Count} arrows visible");
     }
+
     // Replace your existing method with this smarter version
     private List<int> CalculateInitialSpawnIndices()
     {
         List<int> indices = new List<int>();
-        if (routeARPositions.Count < 2 || cumulativeDistances.Count < 2)
+        if (routeWorldPositions.Count < 2 || cumulativeDistances.Count < 2)
         {
             LogErrorAR("Not enough data to calculate initial indices.");
             return indices;
@@ -2081,7 +1914,6 @@ public void TestIndoorRouteOptimal()
             // Set the next ideal target distance
             targetDistance += arrowSpacing;
         }
-
         indices.Sort(); // Ensure the indices are in the correct order
         LogAR($"Initial spawn plan calculated: {indices.Count} arrows.");
         return indices;
@@ -2208,108 +2040,62 @@ public void TestIndoorRouteOptimal()
 
         LogAR($"Metadata set for arrow {routeIndex}: distance={metadata.DistanceFromStart:F1}m, spawn distance={metadata.SpawnDistance:F1}m");
     }
-    private Vector3 CalculateOptimalArrowPosition(Vector3 arPosition, int routeIndex)
+    private Vector3 CalculateOptimalArrowPosition(int routeIndex)
     {
-        Vector3 worldPosition;
+        // Step 1: Convert GPS to world space (keeps X/Z consistent with map)
+        Vector3 worldPosition = GPSToWorld(rawRoutePoints[routeIndex]);
 
-        // Method 1: Transform through primary plane
-        worldPosition = primaryPlane.transform.TransformPoint(arPosition);
-
-        // Method 2: Raycast validation from camera
-        Vector3 cameraToTarget = (worldPosition - arCamera.transform.position).normalized;
-        Vector3 rayStart = arCamera.transform.position;
-
-        List<ARRaycastHit> hits = new List<ARRaycastHit>();
+        // Step 2: Use raycast only to refine Y (height on surface)
         Vector3 screenPoint = arCamera.WorldToScreenPoint(worldPosition);
+        List<ARRaycastHit> hits = new List<ARRaycastHit>();
 
-        // Check if position is within screen bounds and perform raycast
         if (screenPoint.x >= 0 && screenPoint.x <= Screen.width &&
             screenPoint.y >= 0 && screenPoint.y <= Screen.height && screenPoint.z > 0)
         {
             if (raycastManager.Raycast(screenPoint, hits, TrackableType.Planes))
             {
-                worldPosition = hits[0].pose.position;
+                worldPosition.y = hits[0].pose.position.y + arrowHeightOffset;
                 LogAR($"Raycast successful for arrow {routeIndex}");
             }
             else
             {
-                LogAR($"Raycast failed for arrow {routeIndex}, using plane transform");
+                worldPosition.y = primaryPlane.transform.position.y + arrowHeightOffset;
+                LogAR($"Raycast failed for arrow {routeIndex}, fallback Y used");
             }
-        }
-
-        // Method 3: Ground plane projection
-        worldPosition.y = primaryPlane.transform.position.y + arrowHeightOffset;
-
-        return worldPosition;
-    }
-    private void SetupArrowRotation(GameObject arrow, int routeIndex)
-    {
-        Vector3 direction = CalculateArrowDirection(routeIndex);
-
-        if (direction.sqrMagnitude > 0.01f)
-        {
-            // Calculate path rotation
-            Quaternion pathRotation = Quaternion.LookRotation(direction.normalized, Vector3.up);
-
-            // Model correction for arrows pointing up instead of forward
-            Quaternion modelCorrection = Quaternion.FromToRotation(Vector3.up, Vector3.forward);
-
-            // User offset
-            Quaternion userOffset = Quaternion.Euler(0f, arrowYawOffsetDegrees, 0f);
-
-            // Combine rotations: plane * path * model * user
-            arrow.transform.rotation = primaryPlane.transform.rotation * pathRotation * modelCorrection * userOffset;
-
-            LogAR($"Arrow {routeIndex} rotation set: direction={direction}, final rotation={arrow.transform.rotation.eulerAngles}");
         }
         else
         {
-            LogAR($"Warning: Arrow {routeIndex} has no clear direction, using camera forward");
-            arrow.transform.rotation = Quaternion.LookRotation(arCamera.transform.forward, Vector3.up);
+            worldPosition.y = primaryPlane.transform.position.y + arrowHeightOffset;
         }
+
+        return worldPosition;
     }
+    //private void SetupArrowRotation(GameObject arrow, int routeIndex)
+    //{
+    //    Vector3 direction = CalculateArrowDirection(routeIndex);
 
-    private Vector3 ProjectPositionToGround(Vector3 arPosition)
-    {
-        // Transform AR position to world space
-        Vector3 worldPos = primaryPlane.transform.TransformPoint(arPosition);
+    //    if (direction.sqrMagnitude > 0.01f)
+    //    {
+    //        // Calculate path rotation
+    //        Quaternion pathRotation = Quaternion.LookRotation(direction.normalized, Vector3.up);
 
-        // Create a ray from high above the target position downward
-        Vector3 rayStart = worldPos + Vector3.up * 10f;
-        Vector3 rayDirection = Vector3.down;
+    //        // Model correction for arrows pointing up instead of forward
+    //        Quaternion modelCorrection = Quaternion.FromToRotation(Vector3.up, Vector3.forward);
 
-        // Try raycast to ground first
-        RaycastHit hit;
-        if (Physics.Raycast(rayStart, rayDirection, out hit, 20f))
-        {
-            Vector3 groundPos = hit.point;
-            groundPos.y += arrowHeightOffset;
-            LogAR($"Ground raycast hit at: {groundPos} (height: {groundPos.y:F2})");
-            return groundPos;
-        }
+    //        // User offset
+    //        Quaternion userOffset = Quaternion.Euler(0f, arrowYawOffsetDegrees, 0f);
 
-        // Fallback: Try AR raycast from camera to the approximate screen position
-        Vector3 screenPos = arCamera.WorldToScreenPoint(worldPos);
-        if (screenPos.x >= 0 && screenPos.x <= Screen.width &&
-            screenPos.y >= 0 && screenPos.y <= Screen.height && screenPos.z > 0)
-        {
-            List<ARRaycastHit> arHits = new List<ARRaycastHit>();
-            if (raycastManager.Raycast(new Vector2(screenPos.x, screenPos.y), arHits, TrackableType.Planes))
-            {
-                Vector3 arGroundPos = arHits[0].pose.position;
-                arGroundPos.y += arrowHeightOffset;
-                LogAR($"AR raycast hit at: {arGroundPos} (height: {arGroundPos.y:F2})");
-                return arGroundPos;
-            }
-        }
+    //        // Combine rotations: plane * path * model * user
+    //        arrow.transform.rotation = primaryPlane.transform.rotation * pathRotation * modelCorrection * userOffset;
 
-        // Final fallback: Use primary plane height
-        Vector3 fallbackPos = worldPos;
-        fallbackPos.y = primaryPlane.transform.position.y + arrowHeightOffset;
-        LogAR($"Using fallback plane height: {fallbackPos} (plane Y: {primaryPlane.transform.position.y:F2})");
-
-        return fallbackPos;
-    }
+    //        LogAR($"Arrow {routeIndex} rotation set: direction={direction}, final rotation={arrow.transform.rotation.eulerAngles}");
+    //    }
+    //    else
+    //    {
+    //        LogAR($"Warning: Arrow {routeIndex} has no clear direction, using camera forward");
+    //        arrow.transform.rotation = Quaternion.LookRotation(arCamera.transform.forward, Vector3.up);
+    //    }
+    //}
     private void SetupArrowAppearance(GameObject arrow, int routeIndex)
     {
         arrow.name = $"NavArrow_{routeIndex}_{Time.time:F0}";
@@ -2351,7 +2137,7 @@ public void TestIndoorRouteOptimal()
     {
         if (routeIndex == 0)
             return Color.green; // Start point
-        else if (routeIndex == routeARPositions.Count - 1)
+        else if (routeIndex == routeWorldPositions.Count - 1)
             return Color.blue;  // End point
         else if (routeIndex <= 5)
             return Color.cyan;  // Near start
@@ -2364,14 +2150,14 @@ public void TestIndoorRouteOptimal()
         cumulativeDistances.Add(0f);
         totalRouteDistance = 0f;
 
-        for (int i = 1; i < routeARPositions.Count; i++)
+        for (int i = 1; i < routeWorldPositions.Count; i++)
         {
-            float segmentDistance = Vector3.Distance(routeARPositions[i], routeARPositions[i - 1]);
+            float segmentDistance = Vector3.Distance(routeWorldPositions[i], routeWorldPositions[i - 1]);
             totalRouteDistance += segmentDistance;
             cumulativeDistances.Add(totalRouteDistance);
         }
 
-        LogAR($"Route analysis: Total distance {totalRouteDistance:F1}m across {routeARPositions.Count} points");
+        LogAR($"Route analysis: Total distance {totalRouteDistance:F1}m across {routeWorldPositions.Count} points");
     }
 
     private List<Vector2d> GenerateTestRoute(Vector2d start, Vector2d end, int totalPoints)
@@ -2739,7 +2525,7 @@ private void UpdateDebugDisplayEnhanced()
             // Route data
             debug.AppendLine("ROUTE DATA:");
             debug.AppendLine($"Raw Points: {rawRoutePoints?.Count ?? 0}");
-            debug.AppendLine($"AR Positions: {routeARPositions?.Count ?? 0}");
+            debug.AppendLine($"AR Positions: {routeWorldPositions?.Count ?? 0}");
             debug.AppendLine($"Selected: {selectedRouteIndices?.Count ?? 0}");
             debug.AppendLine($"Route Received: {routeReceived}");
             debug.AppendLine($"Route Requested: {routeRequested}");
@@ -2841,7 +2627,7 @@ private void UpdateDebugDisplayEnhanced()
         routeReceived = false;
         arrowsSpawned = false;
         rawRoutePoints.Clear();
-        routeARPositions.Clear();
+        routeWorldPositions.Clear();
         StartCoroutine(RequestNavigationRouteWithMode());
     }
 
@@ -3056,7 +2842,7 @@ private void UpdateDebugDisplayEnhanced()
 
         ClearExistingArrows();
         routeWorldPositions.Clear();
-        routeARPositions.Clear();
+        routeWorldPositions.Clear();
         rawRoutePoints.Clear();
         selectedRouteIndices.Clear();
 
