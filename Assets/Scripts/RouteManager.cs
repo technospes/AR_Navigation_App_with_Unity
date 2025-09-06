@@ -110,8 +110,8 @@ public class RouteManager : MonoBehaviour
     private List<ARAnchor> arrowAnchors = new List<ARAnchor>();
 
     // GPS coordinates
-    private Vector2d currentPosition = new Vector2d(28.45752192559391, 77.49698005440952);
-    private Vector2d destination = new Vector2d(28.458518170006098, 77.49897001364432);
+    private Vector2d currentPosition = new Vector2d(29.907947712366155, 78.09645817912742);
+    private Vector2d destination = new Vector2d(29.907585872781446, 78.0983731075453);
     private Mapbox.Utils.Vector2d referencePosition;
 
     private Vector3 arOriginWorldPos = Vector3.zero;
@@ -128,15 +128,10 @@ public class RouteManager : MonoBehaviour
 
     // Debug info
     private int planesDetected = 0;
-    private int raycastAttempts = 0;
-    private int raycastSuccesses = 0;
     private string currentStatus = "Initializing...";
 
     // Ground anchoring
     private List<StaticArrowData> staticArrows = new List<StaticArrowData>();
-
-    // FIXED: Add ARAnchorManager reference property
-    private ARAnchorManager ARAnchorManagerRef => anchorManager;
 
     [System.Serializable]
     public class StaticArrowData
@@ -1071,12 +1066,13 @@ public void TestIndoorRouteOptimal()
 
         LogAR($"Spawn window: {spawnStart:F1}m to {spawnEnd:F1}m (current: {currentPos:F1}m)");
 
-        // Determine required arrows
-        HashSet<int> requiredIndices = CalculateRequiredArrowIndices(spawnStart, spawnEnd);
-        LogAR($"Required arrows: {requiredIndices.Count} indices");
+        // Determine required arrows (start from current route index to avoid adding old indices)
+        int currentRouteIndex = GetCurrentRouteIndex();
+        HashSet<int> requiredIndices = CalculateRequiredArrowIndices(spawnStart, spawnEnd, currentRouteIndex);
+        LogAR($"Required arrows: {requiredIndices.Count} indices (currentIdx={currentRouteIndex})");
 
-        // Remove arrows outside spawn range
-        RemoveObsoleteArrows(requiredIndices);
+        // Remove arrows outside spawn range OR behind by route distance
+        RemoveObsoleteArrows(requiredIndices, currentPos);
 
         // Add new arrows in spawn range
         List<int> newIndices = FindMissingArrows(requiredIndices);
@@ -1093,7 +1089,7 @@ public void TestIndoorRouteOptimal()
 
         LogAR($"Dynamic update complete: {managedArrowObjects.Count} total arrows");
     }
-    private HashSet<int> CalculateRequiredArrowIndices(float spawnStart, float spawnEnd)
+    private HashSet<int> CalculateRequiredArrowIndices(float spawnStart, float spawnEnd, int startIndex)
     {
         HashSet<int> requiredIndices = new HashSet<int>();
 
@@ -1249,15 +1245,22 @@ public void TestIndoorRouteOptimal()
         return missingIndices;
     }
 
-    private void RemoveObsoleteArrows(HashSet<int> requiredIndices)
+    private void RemoveObsoleteArrows(HashSet<int> requiredIndices, float currentRouteDistance)
     {
         List<GameObject> arrowsToRemove = new List<GameObject>();
+        List<ARAnchor> anchorsToRemove = new List<ARAnchor>();
 
-        foreach (var arrow in managedArrowObjects.ToList())
+        // Cache current user route index once for performance
+        int currentRouteIndex = GetCurrentRouteIndex();
+
+        // Iterate backwards so we can safely remove while looping
+        for (int i = managedArrowObjects.Count - 1; i >= 0; i--)
         {
+            GameObject arrow = managedArrowObjects[i];
+
             if (arrow == null)
             {
-                arrowsToRemove.Add(arrow);
+                managedArrowObjects.RemoveAt(i);
                 continue;
             }
 
@@ -1269,22 +1272,91 @@ public void TestIndoorRouteOptimal()
                 continue;
             }
 
-            if (!requiredIndices.Contains(metadata.RouteIndex))
+            // Calculate if arrow is behind user
+            float distanceFromUser = Vector3.Distance(userARPosition, arrow.transform.position);
+            bool isBehindUser = metadata.RouteIndex < currentRouteIndex &&
+                                distanceFromUser > despawnBehindDistance;
+
+            // Remove if either not required OR behind user
+            if (!requiredIndices.Contains(metadata.RouteIndex) || isBehindUser)
             {
-                LogAR($"Removing arrow {metadata.RouteIndex} (distance: {metadata.DistanceFromStart:F1}m)");
+                LogAR($"Removing arrow {metadata.RouteIndex} (behind: {isBehindUser}, distance: {distanceFromUser:F1}m)");
                 arrowsToRemove.Add(arrow);
+
+                // Track anchor for cleanup
+                Transform parent = arrow.transform.parent;
+                if (parent != null)
+                {
+                    ARAnchor parentAnchor = parent.GetComponent<ARAnchor>();
+                    if (parentAnchor != null && !anchorsToRemove.Contains(parentAnchor))
+                    {
+                        anchorsToRemove.Add(parentAnchor);
+                    }
+                }
             }
         }
 
-        foreach (var arrow in arrowsToRemove)
-        {
-            RemoveArrowSafely(arrow);
-        }
+        // Remove all arrows and anchors safely
+        foreach (var arrow in arrowsToRemove) RemoveArrowCompletely(arrow);
+        foreach (var anchor in anchorsToRemove) if (anchor != null) Destroy(anchor.gameObject);
 
         if (arrowsToRemove.Count > 0)
+            LogAR($"Removed {arrowsToRemove.Count} obsolete/behind arrows + {anchorsToRemove.Count} anchors");
+    }
+    // Helper method to get current route progress
+    private int GetCurrentRouteIndex()
+    {
+        if (routeWorldPositions.Count == 0) return 0;
+
+        float closestDistance = float.MaxValue;
+        int closestIndex = 0;
+
+        for (int i = 0; i < routeWorldPositions.Count; i++)
         {
-            LogAR($"Removed {arrowsToRemove.Count} obsolete arrows");
+            float distance = Vector3.Distance(userARPosition, routeWorldPositions[i]);
+            if (distance < closestDistance)
+            {
+                closestDistance = distance;
+                closestIndex = i;
+            }
         }
+
+        return closestIndex;
+    }
+
+    // Improved complete arrow removal
+    private void RemoveArrowCompletely(GameObject arrow)
+    {
+        if (arrow == null) return;
+
+        ArrowMetadata metadata = arrow.GetComponent<ArrowMetadata>();
+        int routeIndex = metadata != null ? metadata.RouteIndex : -1;
+
+        // Remove from ALL tracking lists
+        managedArrowObjects.Remove(arrow);
+        activeArrows.Remove(arrow);
+        spawnedArrows.Remove(arrow); // This was missing before!
+
+        // Handle anchor removal properly
+        Transform anchorTransform = arrow.transform.parent;
+        if (anchorTransform != null)
+        {
+            ARAnchor anchor = anchorTransform.GetComponent<ARAnchor>();
+            if (anchor != null)
+            {
+                arrowAnchors.Remove(anchor);
+            }
+
+            // Destroy the anchor GameObject (which destroys the arrow too)
+            Destroy(anchorTransform.gameObject);
+        }
+        else
+        {
+            // Direct arrow destruction if no anchor parent
+            Destroy(arrow);
+        }
+
+        LogAR($"Completely removed arrow {routeIndex} from all tracking systems");
     }
     private List<int> SelectRoutePointsImproved(List<Vector3> arPositions, float minSpacing)
     {
@@ -1505,7 +1577,7 @@ public void TestIndoorRouteOptimal()
         ArrowMetadata metadata = arrow.GetComponent<ArrowMetadata>();
         int routeIndex = metadata != null ? metadata.RouteIndex : -1;
 
-        // Remove from all tracking lists
+        // FIXED: Remove from ALL tracking lists consistently
         managedArrowObjects.Remove(arrow);
         activeArrows.Remove(arrow);
         spawnedArrows.Remove(arrow);
@@ -1518,16 +1590,17 @@ public void TestIndoorRouteOptimal()
             if (anchor != null)
             {
                 arrowAnchors.Remove(anchor);
+                LogAR($"Removed anchor for arrow {routeIndex}");
             }
 
             Destroy(anchorTransform.gameObject);
-            LogAR($"Removed arrow {routeIndex} and its anchor");
         }
         else
         {
             Destroy(arrow);
-            LogAR($"Removed orphaned arrow {routeIndex}");
         }
+
+        LogAR($"Safely removed arrow {routeIndex} from all tracking lists");
     }
 
     [ContextMenu("Test Enhanced Dynamic Spawning")]
@@ -1816,60 +1889,73 @@ public void TestIndoorRouteOptimal()
 
             try
             {
-                // Step 1: Get the final, correct world position for the arrow
+                // Step 1: Get stable position with raycast + fallback
                 Vector3 worldPosition = CalculateOptimalArrowPosition(routeIndex);
 
-                // --- Overlap Fix ---
+                // --- Overlap Prevention ---
                 if (lastSpawnedPos.HasValue &&
                     Vector3.Distance(lastSpawnedPos.Value, worldPosition) < arrowSpacing * 0.8f)
                 {
                     LogAR($"Skipping arrow {routeIndex} due to overlap (< {arrowSpacing * 0.8f}m).");
                     continue;
                 }
+                int nextIdx = Mathf.Min(routeIndex + 1, routeWorldPositions.Count - 1);
+                // Flatten the direction
+                Vector3 dir = routeWorldPositions[nextIdx] - routeWorldPositions[routeIndex];
+                dir = Vector3.ProjectOnPlane(dir, Vector3.up);
+                if (dir.sqrMagnitude < 0.01f)
+                    dir = Vector3.ProjectOnPlane(arCamera.transform.forward, Vector3.up);
 
-                // Step 2: Calculate forward direction for arrow orientation
-                Quaternion arrowRotation = Quaternion.identity;
-                if (routeIndex < routeWorldPositions.Count - 1)
-                {
-                    Vector3 dir = routeWorldPositions[routeIndex + 1] - routeWorldPositions[routeIndex];
-                    if (dir.sqrMagnitude > 0.01f)
-                    {
-                        arrowRotation = Quaternion.LookRotation(dir.normalized, Vector3.up);
-                    }
-                }
+                // Get rotation along route
+                Quaternion look = Quaternion.LookRotation(dir.normalized, Vector3.up);
 
-                // Step 3: Create a stable ARAnchor with both position + rotation
-                ARAnchor anchor = anchorManager.AddAnchor(new Pose(worldPosition, arrowRotation));
+                // Rotate prefab's up → forward so it's flat
+                Quaternion prefabCorrection = Quaternion.FromToRotation(Vector3.up, Vector3.forward);
 
+                // Final rotation
+                Quaternion arrowRotation = look * prefabCorrection;
+
+
+                // Step 3: Create stable anchor (new method)
+                ARAnchor anchor = CreateStableAnchor(worldPosition, arrowRotation);
                 if (anchor == null)
                 {
-                    LogErrorAR($"Failed to create anchor for arrow {routeIndex} using AnchorManager.");
+                    LogErrorAR($"Failed to create stable anchor for arrow {routeIndex}");
                     continue;
                 }
 
                 // Step 4: Instantiate arrow prefab as child of anchor
                 GameObject arrow = Instantiate(arrowPrefab, anchor.transform);
 
+                // Step 5: Setup arrow appearance + metadata
                 SetupArrowAppearance(arrow, routeIndex);
                 SetupArrowMetadata(arrow, routeIndex, worldPosition, routeWorldPositions[routeIndex]);
 
+                // Step 6: Add to all tracking lists (fixes "Active Arrows = 0" issue)
                 managedArrowObjects.Add(arrow);
+                activeArrows.Add(arrow);
+                spawnedArrows.Add(arrow);
                 arrowAnchors.Add(anchor);
                 newlySpawnedArrows.Add(arrow);
 
-                // Update last spawned position
+                // Track last spawned arrow for overlap checks
                 lastSpawnedPos = worldPosition;
+
+                LogAR($"✅ Arrow {routeIndex} spawned successfully.");
             }
             catch (System.Exception ex)
             {
                 LogErrorAR($"Exception spawning arrow {routeIndex}: {ex.Message}");
             }
 
-            yield return new WaitForSeconds(0.02f); // Throttle spawnings
+            // Spawn throttle: smoother visuals
+            yield return new WaitForSeconds(0.02f);
         }
 
+        // Post-spawn validation
         yield return new WaitForSeconds(0.1f);
         ValidateSpawnedArrows(newlySpawnedArrows);
+
         LogAR($"✅ Arrow spawning complete: {newlySpawnedArrows.Count}/{indices.Count} new arrows spawned.");
         UpdateStatus($"Navigation ready: {managedArrowObjects.Count} arrows visible");
     }
@@ -2042,33 +2128,89 @@ public void TestIndoorRouteOptimal()
     }
     private Vector3 CalculateOptimalArrowPosition(int routeIndex)
     {
-        // Step 1: Convert GPS to world space (keeps X/Z consistent with map)
+        // Step 1: Convert GPS to world space
         Vector3 worldPosition = GPSToWorld(rawRoutePoints[routeIndex]);
 
-        // Step 2: Use raycast only to refine Y (height on surface)
-        Vector3 screenPoint = arCamera.WorldToScreenPoint(worldPosition);
+        // FIXED: More robust raycast approach for Y positioning
+        Vector3 raycastOrigin = worldPosition;
+        raycastOrigin.y = arCamera.transform.position.y; // Start from camera height
+
         List<ARRaycastHit> hits = new List<ARRaycastHit>();
 
-        if (screenPoint.x >= 0 && screenPoint.x <= Screen.width &&
-            screenPoint.y >= 0 && screenPoint.y <= Screen.height && screenPoint.z > 0)
+        Ray ray = new Ray(raycastOrigin, Vector3.down);
+
+        // Now, call Raycast with the Ray object and the hit list
+        if (raycastManager.Raycast(ray, hits, TrackableType.Planes))
         {
-            if (raycastManager.Raycast(screenPoint, hits, TrackableType.Planes))
+            worldPosition.y = hits[0].pose.position.y + arrowHeightOffset;
+            LogAR($"Direct raycast successful for arrow {routeIndex}");
+        }
+        // Fallback to screen-based raycast
+        else
+        {
+            Vector3 screenPoint = arCamera.WorldToScreenPoint(worldPosition);
+            if (screenPoint.x >= 0 && screenPoint.x <= Screen.width &&
+                screenPoint.y >= 0 && screenPoint.y <= Screen.height && screenPoint.z > 0)
             {
-                worldPosition.y = hits[0].pose.position.y + arrowHeightOffset;
-                LogAR($"Raycast successful for arrow {routeIndex}");
+                if (raycastManager.Raycast(new Vector2(screenPoint.x, screenPoint.y), hits, TrackableType.Planes))
+                {
+                    worldPosition.y = hits[0].pose.position.y + arrowHeightOffset;
+                    LogAR($"Screen raycast successful for arrow {routeIndex}");
+                }
+                else
+                {
+                    // FIXED: More stable fallback
+                    worldPosition.y = primaryPlane.transform.position.y + arrowHeightOffset;
+                    LogAR($"Using stable plane Y for arrow {routeIndex}: {worldPosition.y}");
+                }
             }
             else
             {
                 worldPosition.y = primaryPlane.transform.position.y + arrowHeightOffset;
-                LogAR($"Raycast failed for arrow {routeIndex}, fallback Y used");
             }
-        }
-        else
-        {
-            worldPosition.y = primaryPlane.transform.position.y + arrowHeightOffset;
         }
 
         return worldPosition;
+    }
+
+    // FIXED: Improve anchor creation for stability
+    private ARAnchor CreateStableAnchor(Vector3 worldPosition, Quaternion rotation)
+    {
+        try
+        {
+            List<ARRaycastHit> hits = new List<ARRaycastHit>();
+            Vector3 rayOrigin = new Vector3(worldPosition.x, arCamera.transform.position.y, worldPosition.z);
+
+            // Step 1: Raycast to find an AR plane under the point
+            if (raycastManager.Raycast(new Ray(rayOrigin, Vector3.down), hits, TrackableType.Planes))
+            {
+                ARPlane plane = planeManager.GetPlane(hits[0].trackableId);
+                if (plane != null)
+                {
+                    Pose planePose = new Pose(hits[0].pose.position, rotation);
+                    ARAnchor planeAnchor = anchorManager.AttachAnchor(plane, planePose); // ✅ Recommended method
+                    if (planeAnchor != null)
+                    {
+                        LogAR($"Stable anchor attached to plane at: {planePose.position}");
+                        return planeAnchor;
+                    }
+                }
+            }
+
+            // Step 2: Fallback if no plane → create empty GameObject with ARAnchor
+            GameObject fallbackGO = new GameObject("WorldAnchor");
+            fallbackGO.transform.position = worldPosition;
+            fallbackGO.transform.rotation = rotation;
+
+            ARAnchor fallbackAnchor = fallbackGO.AddComponent<ARAnchor>();
+            LogAR($"Fallback anchor created at: {worldPosition}");
+            return fallbackAnchor;
+        }
+        catch (System.Exception ex)
+        {
+            LogErrorAR($"Exception creating anchor: {ex.Message}");
+            return null;
+        }
     }
     //private void SetupArrowRotation(GameObject arrow, int routeIndex)
     //{
@@ -2102,10 +2244,11 @@ public void TestIndoorRouteOptimal()
         arrow.transform.localPosition = Vector3.zero;
         arrow.transform.localScale = Vector3.one * arrowScale;
 
-        // Set appropriate color with better logic
-        Color arrowColor = DetermineArrowColor(routeIndex);
+        // FIXED: Determine color with clear hierarchy
+        Color arrowColor = DetermineArrowColorFixed(routeIndex);
+        LogAR($"Arrow {routeIndex} assigned color: {arrowColor}");
 
-        // Apply color and ensure visibility
+        // FIXED: Apply color and ensure visibility with material instancing
         Renderer[] renderers = arrow.GetComponentsInChildren<Renderer>();
         bool hasVisibleRenderer = false;
 
@@ -2115,13 +2258,22 @@ public void TestIndoorRouteOptimal()
             {
                 renderer.enabled = true;
 
-                // Create new material instance to avoid shared material issues
-                Material newMaterial = new Material(renderer.material);
-                newMaterial.color = arrowColor;
-                renderer.material = newMaterial;
+                // CRITICAL FIX: Create new material instance to prevent shared material conflicts
+                Material[] materials = new Material[renderer.materials.Length];
+                for (int i = 0; i < renderer.materials.Length; i++)
+                {
+                    materials[i] = new Material(renderer.materials[i]);
+                    materials[i].color = arrowColor;
+
+                    // Force material properties for visibility
+                    if (materials[i].HasProperty("_Color"))
+                        materials[i].SetColor("_Color", arrowColor);
+                    if (materials[i].HasProperty("_BaseColor"))
+                        materials[i].SetColor("_BaseColor", arrowColor);
+                }
+                renderer.materials = materials;
 
                 hasVisibleRenderer = true;
-                LogAR($"Renderer setup: {renderer.name}, color: {arrowColor}");
             }
         }
 
@@ -2133,16 +2285,18 @@ public void TestIndoorRouteOptimal()
         // Ensure arrow is active
         arrow.SetActive(true);
     }
-    private Color DetermineArrowColor(int routeIndex)
+
+    private Color DetermineArrowColorFixed(int routeIndex)
     {
+        // Clear color hierarchy to prevent mixing
         if (routeIndex == 0)
-            return Color.green; // Start point
-        else if (routeIndex == routeWorldPositions.Count - 1)
-            return Color.blue;  // End point
-        else if (routeIndex <= 5)
-            return Color.cyan;  // Near start
+            return new Color(0f, 1f, 0f, 1f);    // Pure green for start
+        else if (routeIndex >= routeWorldPositions.Count - 1)
+            return new Color(0f, 0f, 1f, 1f);    // Pure blue for end
+        else if (routeIndex <= 3)
+            return new Color(0f, 1f, 1f, 1f);    // Pure cyan for near start
         else
-            return Color.yellow; // Middle points
+            return new Color(1f, 1f, 0f, 1f);    // Pure yellow for middle
     }
     private void CalculateCumulativeDistances()
     {
