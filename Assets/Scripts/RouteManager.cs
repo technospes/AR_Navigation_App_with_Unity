@@ -2212,32 +2212,6 @@ public void TestIndoorRouteOptimal()
             return null;
         }
     }
-    //private void SetupArrowRotation(GameObject arrow, int routeIndex)
-    //{
-    //    Vector3 direction = CalculateArrowDirection(routeIndex);
-
-    //    if (direction.sqrMagnitude > 0.01f)
-    //    {
-    //        // Calculate path rotation
-    //        Quaternion pathRotation = Quaternion.LookRotation(direction.normalized, Vector3.up);
-
-    //        // Model correction for arrows pointing up instead of forward
-    //        Quaternion modelCorrection = Quaternion.FromToRotation(Vector3.up, Vector3.forward);
-
-    //        // User offset
-    //        Quaternion userOffset = Quaternion.Euler(0f, arrowYawOffsetDegrees, 0f);
-
-    //        // Combine rotations: plane * path * model * user
-    //        arrow.transform.rotation = primaryPlane.transform.rotation * pathRotation * modelCorrection * userOffset;
-
-    //        LogAR($"Arrow {routeIndex} rotation set: direction={direction}, final rotation={arrow.transform.rotation.eulerAngles}");
-    //    }
-    //    else
-    //    {
-    //        LogAR($"Warning: Arrow {routeIndex} has no clear direction, using camera forward");
-    //        arrow.transform.rotation = Quaternion.LookRotation(arCamera.transform.forward, Vector3.up);
-    //    }
-    //}
     private void SetupArrowAppearance(GameObject arrow, int routeIndex)
     {
         arrow.name = $"NavArrow_{routeIndex}_{Time.time:F0}";
