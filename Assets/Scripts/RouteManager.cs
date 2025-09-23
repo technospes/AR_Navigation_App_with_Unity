@@ -24,6 +24,9 @@ using UnityEngine.Android;
 
 public class RouteManager : MonoBehaviour
 {
+    [Header("Performance")]
+    public int initialPoolSize = 30;
+    private ArrowPool arrowPool;
     private float lastDynamicUpdateTime = 0f;
     private int framesSinceLastSpawn = 0;
     private Dictionary<int, float> arrowSpawnCooldowns = new Dictionary<int, float>();
@@ -174,6 +177,7 @@ public class RouteManager : MonoBehaviour
         RequestLocationPermission();
         LogAR($"Settings: GPS={useDeviceGPS}, TestRoute={useTestRoute}, Spacing={arrowSpacing}, Scale={mapToARScale}");
         InitializeComponents();
+        arrowPool = new ArrowPool(arrowPrefab, initialPoolSize);
         lastUserPositionForUpdate = Vector3.zero;
         StartCoroutine(InitializeLocationServices());
     }
@@ -183,25 +187,23 @@ public class RouteManager : MonoBehaviour
         UpdateDebugDisplay();
         UpdateUserPosition();
 
-        // ENHANCED: More responsive dynamic arrow management
         if (arrowsSpawned && routeWorldPositions.Count > 0)
         {
             float distanceMoved = Vector3.Distance(userARPosition, lastUserPositionForUpdate);
 
-            // More frequent updates for better responsiveness
-            if (distanceMoved > updateDistanceThreshold * 0.3f || // More sensitive
-                Time.time - lastDynamicUpdateTime > 2f) // Time-based updates every 2 seconds
+            // This block handles spawning NEW arrows as you move forward.
+            if (distanceMoved > updateDistanceThreshold)
             {
                 UpdateDynamicArrowSpawning();
                 lastUserPositionForUpdate = userARPosition;
+            }
+
+            // This block calls your new method to clean up OLD arrows.
+            if (Time.time - lastDynamicUpdateTime > 1.5f) // Runs every 1.5 seconds
+            {
+                UpdateArrowVisibilityAndCulling(); // <-- This is the call
                 lastDynamicUpdateTime = Time.time;
             }
-        }
-
-        // ENHANCED: Continuous arrow visibility monitoring
-        if (Time.time % 3f < Time.deltaTime) // Every 3 seconds
-        {
-            ValidateAllArrowVisibility();
         }
     }
 
@@ -1072,7 +1074,7 @@ public void TestIndoorRouteOptimal()
         LogAR($"Required arrows: {requiredIndices.Count} indices (currentIdx={currentRouteIndex})");
 
         // Remove arrows outside spawn range OR behind by route distance
-        RemoveObsoleteArrows(requiredIndices, currentPos);
+        UpdateArrowVisibilityAndCulling();
 
         // Add new arrows in spawn range
         List<int> newIndices = FindMissingArrows(requiredIndices);
@@ -1245,64 +1247,6 @@ public void TestIndoorRouteOptimal()
         return missingIndices;
     }
 
-    private void RemoveObsoleteArrows(HashSet<int> requiredIndices, float currentRouteDistance)
-    {
-        List<GameObject> arrowsToRemove = new List<GameObject>();
-        List<ARAnchor> anchorsToRemove = new List<ARAnchor>();
-
-        // Cache current user route index once for performance
-        int currentRouteIndex = GetCurrentRouteIndex();
-
-        // Iterate backwards so we can safely remove while looping
-        for (int i = managedArrowObjects.Count - 1; i >= 0; i--)
-        {
-            GameObject arrow = managedArrowObjects[i];
-
-            if (arrow == null)
-            {
-                managedArrowObjects.RemoveAt(i);
-                continue;
-            }
-
-            ArrowMetadata metadata = arrow.GetComponent<ArrowMetadata>();
-            if (metadata == null)
-            {
-                LogErrorAR($"Arrow {arrow.name} missing metadata, removing");
-                arrowsToRemove.Add(arrow);
-                continue;
-            }
-
-            // Calculate if arrow is behind user
-            float distanceFromUser = Vector3.Distance(userARPosition, arrow.transform.position);
-            bool isBehindUser = metadata.RouteIndex < currentRouteIndex &&
-                                distanceFromUser > despawnBehindDistance;
-
-            // Remove if either not required OR behind user
-            if (!requiredIndices.Contains(metadata.RouteIndex) || isBehindUser)
-            {
-                LogAR($"Removing arrow {metadata.RouteIndex} (behind: {isBehindUser}, distance: {distanceFromUser:F1}m)");
-                arrowsToRemove.Add(arrow);
-
-                // Track anchor for cleanup
-                Transform parent = arrow.transform.parent;
-                if (parent != null)
-                {
-                    ARAnchor parentAnchor = parent.GetComponent<ARAnchor>();
-                    if (parentAnchor != null && !anchorsToRemove.Contains(parentAnchor))
-                    {
-                        anchorsToRemove.Add(parentAnchor);
-                    }
-                }
-            }
-        }
-
-        // Remove all arrows and anchors safely
-        foreach (var arrow in arrowsToRemove) RemoveArrowCompletely(arrow);
-        foreach (var anchor in anchorsToRemove) if (anchor != null) Destroy(anchor.gameObject);
-
-        if (arrowsToRemove.Count > 0)
-            LogAR($"Removed {arrowsToRemove.Count} obsolete/behind arrows + {anchorsToRemove.Count} anchors");
-    }
     // Helper method to get current route progress
     private int GetCurrentRouteIndex()
     {
@@ -1325,38 +1269,54 @@ public void TestIndoorRouteOptimal()
     }
 
     // Improved complete arrow removal
-    private void RemoveArrowCompletely(GameObject arrow)
+    private void UpdateArrowVisibilityAndCulling()
     {
-        if (arrow == null) return;
+        if (managedArrowObjects.Count == 0) return;
 
-        ArrowMetadata metadata = arrow.GetComponent<ArrowMetadata>();
-        int routeIndex = metadata != null ? metadata.RouteIndex : -1;
+        int currentRouteIndex = GetCurrentRouteIndex();
 
-        // Remove from ALL tracking lists
-        managedArrowObjects.Remove(arrow);
-        activeArrows.Remove(arrow);
-        spawnedArrows.Remove(arrow); // This was missing before!
-
-        // Handle anchor removal properly
-        Transform anchorTransform = arrow.transform.parent;
-        if (anchorTransform != null)
+        // Iterate backwards because we are removing items from the list as we go
+        for (int i = managedArrowObjects.Count - 1; i >= 0; i--)
         {
-            ARAnchor anchor = anchorTransform.GetComponent<ARAnchor>();
-            if (anchor != null)
+            GameObject arrow = managedArrowObjects[i];
+            if (arrow == null)
             {
-                arrowAnchors.Remove(anchor);
+                managedArrowObjects.RemoveAt(i);
+                continue;
             }
 
-            // Destroy the anchor GameObject (which destroys the arrow too)
-            Destroy(anchorTransform.gameObject);
-        }
-        else
-        {
-            // Direct arrow destruction if no anchor parent
-            Destroy(arrow);
-        }
+            ArrowMetadata metadata = arrow.GetComponent<ArrowMetadata>();
+            if (metadata == null) continue;
 
-        LogAR($"Completely removed arrow {routeIndex} from all tracking systems");
+            // --- CULLING LOGIC ---
+            // An arrow is culled if it is far behind your progress on the route
+            bool isFarBehind = (currentRouteIndex > metadata.RouteIndex + 3);
+            float distanceToUser = Vector3.Distance(userARPosition, arrow.transform.position);
+
+            if (isFarBehind && distanceToUser > despawnBehindDistance)
+            {
+                LogAR($"Culling arrow {metadata.RouteIndex} (Reason: Far behind user).");
+
+                // Keep a reference to the anchor before doing anything else
+                Transform anchorTransform = arrow.transform.parent;
+
+                // Remove from all tracking lists
+                managedArrowObjects.RemoveAt(i);
+                activeArrows.Remove(arrow);
+                spawnedArrows.Remove(arrow);
+
+                // Return the arrow GameObject to the pool for reuse
+                arrowPool.Return(arrow);
+
+                // Now, destroy the old ARAnchor GameObject
+                if (anchorTransform != null)
+                {
+                    ARAnchor anchor = anchorTransform.GetComponent<ARAnchor>();
+                    if (anchor != null) arrowAnchors.Remove(anchor);
+                    Destroy(anchorTransform.gameObject);
+                }
+            }
+        }
     }
     private List<int> SelectRoutePointsImproved(List<Vector3> arPositions, float minSpacing)
     {
@@ -1923,9 +1883,12 @@ public void TestIndoorRouteOptimal()
                     LogErrorAR($"Failed to create stable anchor for arrow {routeIndex}");
                     continue;
                 }
-
                 // Step 4: Instantiate arrow prefab as child of anchor
-                GameObject arrow = Instantiate(arrowPrefab, anchor.transform);
+                GameObject arrow = arrowPool.Get(); // Get an arrow from the pool
+                arrow.transform.SetParent(anchor.transform);
+                arrow.transform.localPosition = Vector3.zero;
+                arrow.transform.localRotation = Quaternion.identity;
+                arrow.SetActive(true);
 
                 // Step 5: Setup arrow appearance + metadata
                 SetupArrowAppearance(arrow, routeIndex);
