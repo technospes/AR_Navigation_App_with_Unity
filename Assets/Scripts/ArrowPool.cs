@@ -22,7 +22,6 @@ public class ArrowPool
             pool.Enqueue(arrow);
         }
     }
-
     public GameObject Get()
     {
         if (pool.Count > 0)
