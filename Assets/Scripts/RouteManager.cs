@@ -1288,14 +1288,17 @@ public void TestIndoorRouteOptimal()
             ArrowMetadata metadata = arrow.GetComponent<ArrowMetadata>();
             if (metadata == null) continue;
 
-            // --- CULLING LOGIC ---
-            // An arrow is culled if it is far behind your progress on the route
-            bool isFarBehind = (currentRouteIndex > metadata.RouteIndex + 3);
+            // --- IMPROVED CULLING LOGIC ---
+            // Condition 1: Have we passed this arrow's position in the route?
+            bool hasPassedArrow = metadata.RouteIndex < currentRouteIndex -1;
+
+            // Condition 2: Is the arrow physically far enough away to be culled?
             float distanceToUser = Vector3.Distance(userARPosition, arrow.transform.position);
 
-            if (isFarBehind && distanceToUser > despawnBehindDistance)
+            // If BOTH conditions are true, we cull the arrow.
+            if (hasPassedArrow && distanceToUser > despawnBehindDistance)
             {
-                LogAR($"Culling arrow {metadata.RouteIndex} (Reason: Far behind user).");
+                LogAR($"Culling arrow {metadata.RouteIndex} (Reason: Passed and distant).");
 
                 // Keep a reference to the anchor before doing anything else
                 Transform anchorTransform = arrow.transform.parent;
@@ -1827,100 +1830,67 @@ public void TestIndoorRouteOptimal()
             yield break;
         }
 
-        List<GameObject> newlySpawnedArrows = new List<GameObject>();
-
-        // Track last spawned position to prevent overlap
-        Vector3? lastSpawnedPos = null;
-
         foreach (int routeIndex in indices)
         {
-            if (routeIndex >= routeWorldPositions.Count)
-            {
-                LogErrorAR($"Invalid route index: {routeIndex}");
-                continue;
-            }
+            if (routeIndex >= routeWorldPositions.Count) continue;
 
-            // Prevent duplicates
             if (managedArrowObjects.Any(a => a != null && a.GetComponent<ArrowMetadata>()?.RouteIndex == routeIndex))
             {
                 LogAR($"Arrow {routeIndex} already exists, skipping.");
                 continue;
             }
 
-            try
+            Vector3 targetARPosition = routeWorldPositions[routeIndex];
+            Vector3 finalWorldPosition = CalculateOptimalArrowPosition(routeIndex);
+
+            // --- THIS IS THE CRITICAL FIX FOR "POINTING TO THE JUNGLE" ---
+            // 1. We calculate the direction vector to the next point on the route.
+            Vector3 directionToNext = Vector3.forward;
+            if (routeIndex < routeWorldPositions.Count - 1)
             {
-                // Step 1: Get stable position with raycast + fallback
-                Vector3 worldPosition = CalculateOptimalArrowPosition(routeIndex);
-
-                // --- Overlap Prevention ---
-                if (lastSpawnedPos.HasValue &&
-                    Vector3.Distance(lastSpawnedPos.Value, worldPosition) < arrowSpacing * 0.8f)
-                {
-                    LogAR($"Skipping arrow {routeIndex} due to overlap (< {arrowSpacing * 0.8f}m).");
-                    continue;
-                }
-                int nextIdx = Mathf.Min(routeIndex + 1, routeWorldPositions.Count - 1);
-                // Flatten the direction
-                Vector3 dir = routeWorldPositions[nextIdx] - routeWorldPositions[routeIndex];
-                dir = Vector3.ProjectOnPlane(dir, Vector3.up);
-                if (dir.sqrMagnitude < 0.01f)
-                    dir = Vector3.ProjectOnPlane(arCamera.transform.forward, Vector3.up);
-
-                // Get rotation along route
-                Quaternion look = Quaternion.LookRotation(dir.normalized, Vector3.up);
-
-                // Rotate prefab's up → forward so it's flat
-                Quaternion prefabCorrection = Quaternion.FromToRotation(Vector3.up, Vector3.forward);
-
-                // Final rotation
-                Quaternion arrowRotation = look * prefabCorrection;
-
-
-                // Step 3: Create stable anchor (new method)
-                ARAnchor anchor = CreateStableAnchor(worldPosition, arrowRotation);
-                if (anchor == null)
-                {
-                    LogErrorAR($"Failed to create stable anchor for arrow {routeIndex}");
-                    continue;
-                }
-                // Step 4: Instantiate arrow prefab as child of anchor
-                GameObject arrow = arrowPool.Get(); // Get an arrow from the pool
-                arrow.transform.SetParent(anchor.transform);
-                arrow.transform.localPosition = Vector3.zero;
-                arrow.transform.localRotation = Quaternion.identity;
-                arrow.SetActive(true);
-
-                // Step 5: Setup arrow appearance + metadata
-                SetupArrowAppearance(arrow, routeIndex);
-                SetupArrowMetadata(arrow, routeIndex, worldPosition, routeWorldPositions[routeIndex]);
-
-                // Step 6: Add to all tracking lists (fixes "Active Arrows = 0" issue)
-                managedArrowObjects.Add(arrow);
-                activeArrows.Add(arrow);
-                spawnedArrows.Add(arrow);
-                arrowAnchors.Add(anchor);
-                newlySpawnedArrows.Add(arrow);
-
-                // Track last spawned arrow for overlap checks
-                lastSpawnedPos = worldPosition;
-
-                LogAR($"✅ Arrow {routeIndex} spawned successfully.");
-            }
-            catch (System.Exception ex)
-            {
-                LogErrorAR($"Exception spawning arrow {routeIndex}: {ex.Message}");
+                directionToNext = routeWorldPositions[routeIndex + 1] - targetARPosition;
+                directionToNext.y = 0; // We make it flat on the ground.
             }
 
-            // Spawn throttle: smoother visuals
+            // 2. If points are too close, we use the camera's forward direction as a fallback.
+            if (directionToNext.sqrMagnitude < 0.01f)
+            {
+                directionToNext = arCamera.transform.forward;
+                directionToNext.y = 0;
+            }
+
+            // 3. This single line correctly calculates the rotation. It makes the arrow's "forward"
+            //    direction point towards the next waypoint. The old, incorrect "prefabCorrection" 
+            //    line of code that caused the tilt is now gone.
+            Quaternion arrowRotation = Quaternion.LookRotation(directionToNext.normalized, Vector3.up);
+            // --- END OF FIX ---
+
+            ARAnchor anchor = CreateStableAnchor(finalWorldPosition, arrowRotation);
+            if (anchor == null)
+            {
+                LogErrorAR($"Failed to create stable anchor for arrow {routeIndex}");
+                continue;
+            }
+
+            // Use the object pool to get an arrow
+            GameObject arrow = arrowPool.Get();
+            arrow.transform.SetParent(anchor.transform);
+            arrow.transform.localPosition = Vector3.zero;
+            arrow.transform.localRotation = Quaternion.identity;
+            arrow.SetActive(true);
+
+            SetupArrowAppearance(arrow, routeIndex);
+            SetupArrowMetadata(arrow, routeIndex, finalWorldPosition, targetARPosition);
+
+            // Add to all tracking lists
+            managedArrowObjects.Add(arrow);
+            activeArrows.Add(arrow);
+            spawnedArrows.Add(arrow);
+            arrowAnchors.Add(anchor);
+
+            LogAR($"✅ Arrow {routeIndex} spawned successfully.");
             yield return new WaitForSeconds(0.02f);
         }
-
-        // Post-spawn validation
-        yield return new WaitForSeconds(0.1f);
-        ValidateSpawnedArrows(newlySpawnedArrows);
-
-        LogAR($"✅ Arrow spawning complete: {newlySpawnedArrows.Count}/{indices.Count} new arrows spawned.");
-        UpdateStatus($"Navigation ready: {managedArrowObjects.Count} arrows visible");
     }
 
     // Replace your existing method with this smarter version
