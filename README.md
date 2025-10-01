@@ -1,7 +1,7 @@
 
 ---
 
-# 📄 **README for AR Indoor & Outdoor Navigation**  
+# 📄 **AR Indoor & Outdoor Navigation**  
 
 ```markdown
 # 🗺️ AR Indoor & Outdoor Navigation System
